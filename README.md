@@ -23,6 +23,7 @@ TypeRegistry().register("Dog", Dog, root=Path("Animals"))
 ```
 
 `register` also accepts an `importlib.metadata.EntryPoint`, which is only loaded when the type is needed.
+Registering a name again raises a `RegistrationError`, unless `replace=True`, e.g. for a class redefined in a notebook.
 While we could have avoided a registry, the alternative is persisting implementation-specific info,
 such as the module and class names, making code refactoring very difficult.
 The optional `root` groups types, e.g., you might specify a root of `Animals` for classes `Dog`, `Cat`, `Bunyip` etc.
@@ -222,6 +223,19 @@ best_boy, blofeld = store.read_all(
 ```python
 loaded = store.read([best_boy.object_id, blofeld.object_id])
 ```
+
+### Deleting
+`Persistable.delete` (or `ObjectStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
+a new version of their persisted data with `active=False`. Reads no longer find them, but their data is kept: reads
+as of earlier times still do, and references to them still resolve. Writing a deleted object again restores it.
+
+```python
+best_boy.delete(store)
+Dog.read(store, name="Cerberus")  # Raises UnknownObjectError
+best_boy.write(store)  # Restored
+```
+
+Deleting is checked for conflicts as writing is, and objects not persisted, or already deleted, are ignored.
 
 ### Bitemporality
 Each record has an `effective_time`, when it takes effect, and an `entry_time`, when it was written. Pass

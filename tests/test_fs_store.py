@@ -39,6 +39,8 @@ from pypersistable import (
     WriteConflictError,
     persistable_arrow_converter,
 )
+from pypersistable.arrow import dataclass_fields
+from pypersistable.persistable_store import ObjectRecord
 
 
 @pytest.fixture(params=list(RecordFormat), ids=lambda f: f.name)
@@ -260,6 +262,94 @@ def test_force_overwrite_out_of_date(store):
     with pytest.warns(UserWarning, match="Overwriting: Node/.* was written at"):
         mine.write(store, force_overwrite=True)
     assert Node.read(store, name="a") == mine
+
+
+def test_delete(store):
+    node = Node(name="a")
+    node.write(store)
+    before = dt.datetime.now(dt.UTC)
+    node.delete(store, effective_time=before + dt.timedelta(days=1))
+
+    with pytest.raises(UnknownObjectError):
+        Node.read(store, name="a")
+    assert store.read([node.object_id]) == {}
+
+    # Its data is kept: found as of before it was deleted, by either time
+    assert Node.read(store, name="a", entry_time=before) == node
+    assert Node.read(store, name="a", effective_time=before) == node
+
+
+def test_parquet_records_written_before_active(tmp_path):
+    # As written before ObjectRecord.active was added: in no file, so read as its default
+    before = persistable_arrow_converter()
+    before.add_struct(
+        lambda t: (
+            {k: v for k, v in dataclass_fields(t).items() if k != "active"}
+            if issubclass(t, ObjectRecord)
+            else None
+        )
+    )
+    node = Node(name="a")
+    node.write(FSStore(f"file://{tmp_path}", arrow_converter=before))
+    assert Node.read(FSStore(f"file://{tmp_path}"), name="a") == node
+
+
+def test_delete_ignores_unpersisted_and_deleted(store, spy):
+    Node(name="a").delete(store)
+    node = Node(name="b")
+    node.write(store)
+    node.delete(store)
+    node.delete(store)
+    assert spy["writes"] == [{"Node": 1}, {"Node": 1}]
+
+
+def test_write_restores_deleted(store):
+    node = Node(name="a")
+    node.write(store)
+    node.delete(store)
+    node.write(store)  # Unchanged, but restored
+    assert Node.read(store, name="a") == node
+
+    # Also by an object constructed anew
+    Node.read(store, name="a").delete(store)
+    restored = Node(name="a", next=Node(name="b"))
+    restored.write(store)
+    assert Node.read(store, name="a") == restored
+
+
+def test_delete_out_of_date_raises(store):
+    Node(name="a").write(store)
+    mine, theirs = Node.read(store, name="a"), Node.read(store, name="a")
+    theirs.next = Node(name="b")
+    theirs.write(store)
+
+    with pytest.raises(WriteConflictError, match="Node/.* was written at"):
+        mine.delete(store)
+    with pytest.warns(UserWarning, match="Overwriting"):
+        mine.delete(store, force_overwrite=True)
+    with pytest.raises(UnknownObjectError):
+        Node.read(store, name="a")
+
+
+def test_reference_to_deleted_resolves(store):
+    head = Node(name="a", next=Node(name="b"))
+    head.write(store)
+    head.next.delete(store)
+
+    with pytest.raises(UnknownObjectError):
+        Node.read(store, name="b")
+    assert Node.read(store, name="a") == head
+
+
+def test_require_load_of_existing_delete(strict_store):
+    Node(name="a").write(strict_store)
+    with pytest.raises(WriteConflictError, match="was not read"):
+        Node(name="a").delete(strict_store)
+
+    Node.read(strict_store, name="a").delete(strict_store)
+    restored = Node(name="a", next=Node(name="b"))
+    restored.write(strict_store)  # A deleted object may be restored without reading it
+    assert Node.read(strict_store, name="a") == restored
 
 
 def test_object_entry_time(store):
@@ -695,7 +785,9 @@ def test_added_field_without_default_raises(store, redefine, tmp_path):
     assert len(schema_files(tmp_path)) == 1  # Not recorded
 
 
-def test_changed_field_type_raises(store, redefine):
+# Including rewriting the object written: checked before the write reads its current version
+@pytest.mark.parametrize("name", ["new", "old"])
+def test_changed_field_type_raises(store, redefine, name):
     Evolving(name="old", added=1).write(store)
     redefine(Evolving, EvolvingRetyped)
     match = (
@@ -704,7 +796,32 @@ def test_changed_field_type_raises(store, redefine):
         else "cannot read"
     )
     with pytest.raises(IncompatibleSchemaError, match=match):
-        EvolvingRetyped(name="new").write(store)
+        EvolvingRetyped(name=name).write(store)
+
+
+def define_redefined(value_type: type) -> type:
+    # As a notebook might, redefining a class of the same name
+    return dataclass(
+        type(
+            "Redefined",
+            (Identifiable,),
+            {
+                "__annotations__": {"name": IdField[str], "value": value_type},
+                "__module__": __name__,
+            },
+        )
+    )
+
+
+def test_redefined_type_is_checked(store):
+    before = define_redefined(int)
+    registry.register("Redefined", before, replace=True)
+    before(name="a", value=1).write(store)
+
+    after = define_redefined(str)
+    registry.register("Redefined", after, replace=True)
+    with pytest.raises(IncompatibleSchemaError):
+        after(name="a", value="1").write(store)
 
 
 def test_unrecorded_schema_is_checked(store, redefine, tmp_path):

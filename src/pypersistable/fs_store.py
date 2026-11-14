@@ -67,8 +67,13 @@ _ARROW_CONVERTER = persistable_arrow_converter()
 _SCHEMA_SUFFIX = ".jsonschema"
 
 
+def _filename(entry_time: dt.datetime) -> str:
+    # Unique, as concurrent writers may share an entry time. Not ":", which some file systems disallow
+    return f"{entry_time.isoformat().replace(':', '~')}-{uuid4().hex[:8]}"
+
+
 def _entry_time(filename: str) -> dt.datetime:
-    # Of a file named by _write: <entry time, with ":" replaced by "~">-<unique suffix>.<extension>
+    # Of a file named by _filename, with an extension
     return dt.datetime.fromisoformat(filename.rpartition("-")[0].replace("~", ":"))
 
 
@@ -264,9 +269,14 @@ class FSStore(PersistableStore):
         # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own time zone
         schema = self.__arrow.arrow_schema(self.record_type(typ))
         table = relation.to_arrow_table()
-        records = (
-            table.select(schema.names).cast(schema).to_pylist(maps_as_pydicts="strict")
-        )
+        # Columns in no file, i.e. added to ObjectRecord since they were written, as nulls: dropped by _drop_absent
+        columns = {
+            f.name: table[f.name]
+            if f.name in table.column_names
+            else pa.nulls(len(table), f.type)
+            for f in schema
+        }
+        records = pa.table(columns).cast(schema).to_pylist(maps_as_pydicts="strict")
         filenames = table["filename"].to_pylist()
 
         for f in set(filenames) - self.__checked_files:
@@ -305,7 +315,12 @@ class FSStore(PersistableStore):
                 for typ, ids in by_type.items()
             }
 
-    def __check_schema(self, typ: type[Persistable], filename: str):
+    def _check_types(self, types: set[type[Persistable]]):
+        for typ in types - self.__checked_types:
+            self.__check_schema(typ)
+            self.__checked_types.add(typ)
+
+    def __check_schema(self, typ: type[Persistable]):
         """On this store's first write of typ: checks it can read the objects persisted, if its schema has changed since
         they were written, recording its new JSON schema"""
         directory = self.__directory(typ)
@@ -337,6 +352,7 @@ class FSStore(PersistableStore):
                         ) from None
 
         self.__fs.makedirs(directory, exist_ok=True)
+        filename = _filename(dt.datetime.now(dt.UTC))
         self.__fs.write_bytes(f"{directory / filename}{_SCHEMA_SUFFIX}", dumps(schema))
 
     def _write(
@@ -344,13 +360,7 @@ class FSStore(PersistableStore):
         by_type: dict[type[Persistable], list[dict[str, Any]]],
         entry_time: dt.datetime,
     ):
-        # Unique, as concurrent writers may share an entry time. Not ":", which some file systems disallow
-        filename = f"{entry_time.isoformat().replace(':', '~')}-{uuid4().hex[:8]}"
-
-        for typ in by_type.keys() - self.__checked_types:  # Before writing anything
-            self.__check_schema(typ, filename)
-            self.__checked_types.add(typ)
-
+        filename = _filename(entry_time)
         for typ, records in by_type.items():
             directory = self.__directory(typ)
             self.__fs.makedirs(directory, exist_ok=True)

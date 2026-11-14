@@ -177,8 +177,10 @@ class Persistable(ABC):
                 db, cls, object_id, kwargs, effective_time, entry_time
             )
 
+        # Not within the try: a KeyError raised reading is not an unknown object
+        objects = db.read([object_id], effective_time, entry_time)
         try:
-            return db.read([object_id], effective_time, entry_time)[object_id]
+            return objects[object_id]
         except KeyError:
             raise UnknownObjectError(cls, kwargs, object_id) from None
 
@@ -194,6 +196,17 @@ class Persistable(ABC):
             effective_time=effective_time,
             force_overwrite=force_overwrite,
             by_reference=by_reference,
+        )
+
+    def delete(
+        self,
+        db: ObjectStore,
+        effective_time: dt.datetime = dt.datetime.max,
+        force_overwrite: bool = False,
+    ) -> None:
+        """Marks this object deleted: see ObjectStore.delete. Writing it again restores it"""
+        db.delete(
+            [self], effective_time=effective_time, force_overwrite=force_overwrite
         )
 
 

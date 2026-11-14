@@ -40,6 +40,13 @@ class ObjectStore:
         by_reference: bool = True,
     ): ...
 
+    def delete(
+        self,
+        objects: Iterable[Any],
+        effective_time: dt.datetime = dt.datetime.max,
+        force_overwrite: bool = False,
+    ): ...
+
 
 @dataclass(frozen=True)
 class _ReadKey:
