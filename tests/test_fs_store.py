@@ -3,12 +3,14 @@ import datetime as dt
 import os
 from dataclasses import dataclass
 from decimal import Decimal
-from enum import StrEnum
+from enum import Enum, IntEnum, StrEnum
+from ipaddress import IPv4Address
+from typing import Annotated, Literal
 from uuid import UUID
 
 import duckdb
+import pyarrow as pa
 import pytest
-from anyschema.exceptions import UnsupportedDTypeError
 from models import (
     Cat,
     Counterparty,
@@ -21,10 +23,16 @@ from models import (
     TradingBook,
     registry,
 )
-from pyarrow import ArrowInvalid, ArrowNotImplementedError
-from pydantic_core import PydanticSerializationError
+from pydantic import Field, NaiveDatetime
 
-from pypersistable import FSStore, Identifiable, IdField, RecordFormat
+from pypersistable import (
+    FSStore,
+    Identifiable,
+    IdField,
+    RecordFormat,
+    UnsupportedTypeError,
+    persistable_arrow_converter,
+)
 from pypersistable.object_store import UnknownObjectError
 
 
@@ -286,13 +294,25 @@ def test_parquet_by_value_raises(tmp_path):
 def test_plain_union(store):
     plain = PlainUnion(name="p", value="text")
     if store.record_format is RecordFormat.Parquet:
-        with pytest.raises(
-            UnsupportedDTypeError, match="Use Reference.*or DiscriminatedUnion"
-        ):
+        with pytest.raises(UnsupportedTypeError, match=r"\. Use DiscriminatedUnion"):
             plain.write(store)
     else:
         plain.write(store)
         assert PlainUnion.read(store, name="p") == plain
+
+
+@pytest.mark.parametrize(
+    ("hint", "suggestion"),
+    [
+        (int | str, r"\. Use DiscriminatedUnion"),
+        (Counterparty | TradingBook | None, "Use Reference.*or DiscriminatedUnion"),
+        (Counterparty | int, r"\. Use DiscriminatedUnion"),
+    ],
+    ids=str,
+)
+def test_union_suggestion(hint, suggestion):
+    with pytest.raises(UnsupportedTypeError, match=suggestion):
+        persistable_arrow_converter().arrow_type(hint)
 
 
 # Field type support, by format. Known failures are strict xfails, so fixing one fails the run until
@@ -303,75 +323,52 @@ class Colour(StrEnum):
     Red = "red"
 
 
+class Shape(Enum):
+    Square = "square"
+
+
+class Size(IntEnum):
+    Large = 3
+
+
 Json, Parquet = RecordFormat.Json, RecordFormat.Parquet
+naive = dt.datetime(2026, 1, 2, 3, 4, 5, 6)
 
 # label: (field type, value, {format: (failure reason, exception raised)})
 FIELD_TYPES = {
-    "decimal": (
-        Decimal,
+    "decimal": (Decimal, Decimal("12.50"), {}),
+    "decimal_constrained": (
+        Annotated[Decimal, Field(max_digits=10, decimal_places=2)],
         Decimal("12.50"),
-        {
-            Parquet: (
-                "anyschema Decimal has no precision/scale, so values are rescaled",
-                ArrowInvalid,
-            )
-        },
+        {},
     ),
     "date": (dt.date, dt.date(2026, 1, 2), {}),
     "time": (dt.time, dt.time(3, 4, 5), {}),
-    "naive_datetime": (dt.datetime, dt.datetime(2026, 1, 2, 3, 4, 5, 6), {}),
-    "aware_datetime": (
+    "naive_datetime": (
         dt.datetime,
-        dt.datetime(2026, 1, 2, 3, 4, 5, 6, tzinfo=dt.UTC),
-        {Parquet: ("Silently loses the time zone", AssertionError)},
+        naive,
+        {Parquet: ("datetime is stored as UTC: use NaiveDatetime", AssertionError)},
     ),
-    "timedelta": (
-        dt.timedelta,
-        dt.timedelta(hours=1, microseconds=5),
-        {Parquet: ("Silently reads back a different value", AssertionError)},
+    "naive_datetime_annotated": (NaiveDatetime, naive, {}),
+    "aware_datetime": (dt.datetime, naive.replace(tzinfo=dt.UTC), {}),
+    "aware_datetime_not_utc": (
+        dt.datetime,
+        naive.replace(tzinfo=dt.timezone(dt.timedelta(hours=2))),
+        {},
     ),
-    "bytes": (
-        bytes,
-        b"\xff\x00",
-        {
-            Json: (
-                "pydantic's default ser_json_bytes='utf8' cannot encode non-UTF-8",
-                PydanticSerializationError,
-            )
-        },
-    ),
-    "str_enum": (
-        Colour,
-        Colour.Red,
-        {
-            Parquet: (
-                "narwhals cannot convert an Enum dtype to pyarrow",
-                NotImplementedError,
-            )
-        },
-    ),
+    "timedelta": (dt.timedelta, dt.timedelta(hours=1, microseconds=5), {}),
+    "bytes": (bytes, b"\xff\x00", {}),
+    "str_enum": (Colour, Colour.Red, {}),
+    "enum": (Shape, Shape.Square, {}),
+    "int_enum": (Size, Size.Large, {}),
+    "literal": (Literal["a", "b"], "b", {}),
     "tuple": (tuple[str, ...], ("a", "b"), {}),
-    "frozenset": (
-        frozenset[str],
-        frozenset({"a"}),
-        {Parquet: ("anyschema has no parser for sets", NotImplementedError)},
-    ),
-    "uuid": (
-        UUID,
-        UUID(int=1),
-        {Parquet: ("anyschema has no parser for UUID", NotImplementedError)},
-    ),
+    "set": (set[int], {1, 2}, {}),
+    "frozenset": (frozenset[str], frozenset({"a"}), {}),
+    "uuid": (UUID, UUID(int=1), {}),
     "optional_none": (int | None, None, {}),
-    "dict": (
-        dict[str, int],
-        {"a": 1},
-        {
-            Parquet: (
-                "anyschema maps dict to an empty struct, which Parquet rejects",
-                ArrowNotImplementedError,
-            )
-        },
-    ),
+    "dict": (dict[str, int], {"a": 1}, {}),
+    "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
 }
 
 
@@ -414,6 +411,27 @@ def test_field_type_round_trip(tmp_path, holder, value, record_format):
 
     read = holder.read(store, name="x")
     assert read == obj
-    assert type(read.value) is type(
-        value
-    )  # e.g. a str would compare equal to a StrEnum
+    # e.g. a str would compare equal to a StrEnum
+    assert type(read.value) is type(value)
+
+
+@dataclass
+class Host(Identifiable):
+    name: IdField[str]
+    address: IPv4Address
+
+
+registry.register(Host.__name__, Host)
+
+
+def test_parquet_custom_type(tmp_path):
+    url = f"file://{tmp_path}"
+    with pytest.raises(UnsupportedTypeError, match="IPv4Address"):
+        Host(name="h", address=IPv4Address("10.0.0.1")).write(FSStore(url))
+
+    converter = persistable_arrow_converter()
+    converter.add_type(IPv4Address, pa.string(), str)
+    store = FSStore(url, arrow_converter=converter)
+    host = Host(name="h", address=IPv4Address("10.0.0.1"))
+    host.write(store)
+    assert Host.read(store, name="h") == host

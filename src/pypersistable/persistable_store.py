@@ -6,7 +6,7 @@ from enum import Enum, auto
 from functools import cache
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, TypeAdapter
 
 from .discriminated_union import STRUCT_LAYOUT
 from .object_store import ObjectStore
@@ -61,7 +61,15 @@ class PersistableStore(ObjectStore):
     @cache
     def record_type(cls, typ: type[Persistable]) -> type[ObjectRecord]:
         return make_dataclass(
-            f"{typ.__qualname__}Record", [("data", typ)], bases=(ObjectRecord,)
+            f"{typ.__qualname__}Record",
+            [("data", typ)],
+            bases=(ObjectRecord,),
+            # base64 in JSON, as bytes need not be valid UTF-8 (pydantic's default)
+            namespace={
+                "__pydantic_config__": ConfigDict(
+                    ser_json_bytes="base64", val_json_bytes="base64"
+                )
+            },
         )
 
     @classmethod

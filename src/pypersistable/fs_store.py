@@ -1,35 +1,79 @@
 import datetime as dt
-from functools import cache
 from pathlib import Path
-from typing import Any
+from types import NoneType, UnionType
+from typing import Any, Union, get_args, get_origin
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
-from anyschema import AnySchema
 from fsspec import url_to_fs
 from orjson import dumps
 
-from ._anyschema import PIPELINE, dataclass_fields
+from .arrow import ArrowConverter, UnsupportedTypeError
+from .discriminated_union import TAG_FIELD, DiscriminatedUnionInfo
 from .persistable import Persistable
 from .persistable_id import PersistableId
-from .persistable_store import ObjectRecord, PersistableStore, RecordFormat
+from .persistable_store import PersistableStore, RecordFormat
+from .reference import _Reference
 from .type_registry import TypeRegistry
 
 
+def persistable_arrow_converter() -> ArrowConverter:
+    """An ArrowConverter for Persistables, handling Reference and DiscriminatedUnion. Add handlers for your own types"""
+
+    def union(_: ArrowConverter, hint: Any, __: tuple[Any, ...]) -> None:
+        # Only T | None is supported (by ArrowConverter): point to the alternatives
+        if (
+            get_origin(hint) in (Union, UnionType)
+            and len(members := set(get_args(hint)) - {NoneType}) > 1
+        ):
+            persistable = all(
+                isinstance(m, type) and issubclass(m, Persistable) for m in members
+            )
+            raise UnsupportedTypeError(
+                f"Unsupported union {hint}: only T | None is supported. "
+                f"Use {'Reference[...] or ' if persistable else ''}DiscriminatedUnion[...] instead"
+            )
+
+    def reference(
+        _: ArrowConverter, __: Any, metadata: tuple[Any, ...]
+    ) -> pa.DataType | None:
+        # Persisted as its object id
+        return pa.string() if any(isinstance(m, _Reference) for m in metadata) else None
+
+    def discriminated_union(
+        converter: ArrowConverter, _: Any, metadata: tuple[Any, ...]
+    ) -> pa.DataType | None:
+        # A struct of the tag and a nullable field per member: see discriminated_union.STRUCT_LAYOUT
+        for info in (m for m in metadata if isinstance(m, DiscriminatedUnionInfo)):
+            members = ((tag, converter.arrow_type(t)) for tag, t in info.members)
+            return pa.struct([(TAG_FIELD, pa.string()), *members])
+        return None
+
+    converter = ArrowConverter()
+    converter.add_handler(union)  # Added first, so checked after the others
+    converter.add_handler(reference)
+    converter.add_handler(discriminated_union)
+    return converter
+
+
+_ARROW_CONVERTER = persistable_arrow_converter()
+
+
 class FSStore(PersistableStore):
-    def __init__(self, url: str, record_format: RecordFormat = RecordFormat.Parquet):
+    def __init__(
+        self,
+        url: str,
+        record_format: RecordFormat = RecordFormat.Parquet,
+        arrow_converter: ArrowConverter | None = None,
+    ):
+        """arrow_converter: for Parquet, defaults to persistable_arrow_converter()"""
         super().__init__(record_format)
+        self.__arrow = arrow_converter or _ARROW_CONVERTER
         self.__fs, root = url_to_fs(url)
         self.__root = Path(root)
         self.__conn = duckdb.connect()
         self.__conn.register_filesystem(self.__fs)
-
-    @classmethod
-    @cache
-    def __schema(cls, typ: type[ObjectRecord]) -> pa.Schema:
-        schema = AnySchema(spec=dataclass_fields(typ), pipeline=PIPELINE)
-        return schema.to_arrow()
 
     def __directory(self, typ: type[Persistable]) -> Path:
         # Store root / TypeRegistry root / registered name
@@ -86,11 +130,14 @@ class FSStore(PersistableStore):
                     raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
                 continue
 
-            results[typ] = (
-                relation.to_arrow_table().to_pylist()
-                if parquet
-                else [row for (row,) in relation.fetchall()]
-            )
+            if parquet:
+                # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own
+                # time zone
+                schema = self.__arrow.arrow_schema(self.record_type(typ))
+                table = relation.to_arrow_table().select(schema.names).cast(schema)
+                results[typ] = table.to_pylist(maps_as_pydicts="strict")
+            else:
+                results[typ] = [row for (row,) in relation.fetchall()]
 
         return results
 
@@ -107,8 +154,10 @@ class FSStore(PersistableStore):
             path = directory / filename
 
             if self.record_format is RecordFormat.Parquet:
-                schema = self.__schema(self.record_type(typ))
-                table = pa.Table.from_pylist(records, schema=schema)
+                schema = self.__arrow.arrow_schema(self.record_type(typ))
+                table = pa.Table.from_pylist(
+                    self.__arrow.arrow_value(records), schema=schema
+                )
                 with pq.ParquetWriter(
                     f"{path}.parquet", schema, filesystem=self.__fs
                 ) as writer:

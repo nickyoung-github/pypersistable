@@ -12,19 +12,6 @@ wheels = [
 ]
 
 [[package]]
-name = "anyschema"
-version = "0.4.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "narwhals" },
-    { name = "typing-extensions" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/86/b3/6c9d6ba99ded5d5d536ff621f22e83e053025ad7d0409b25a7d3a579298a/anyschema-0.4.0.tar.gz", hash = "sha256:c8314c39f23db5e3eea6539af3680cc0890bae6a6d46d18c89964e77ecc6293b", size = 78989, upload-time = "2026-11-10T20:13:56.855Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/7c/9576db3b7fa4a52a9434ad2ed605059ffef9db03b4605428a0ff07837288/anyschema-0.4.0-py3-none-any.whl", hash = "sha256:d77bcf8c55f1eb596614ec21ff6a375f73eba3c47e374fbc07111ab4ccaa1378", size = 46954, upload-time = "2026-11-10T20:13:55.904Z" },
-]
-
-[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -160,15 +147,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/01/e1/2069291243c926a2ff1cd706c7f3eeb9b62144bf60f77c9fb9ff2fb26bd3/iniconfig-2.3.1.tar.gz", hash = "sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960", size = 21209, upload-time = "2026-10-06T22:48:38.076Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/56/43/4ca9e49d27a1fcf6bece6f6aec0ea46bb9112489b93d4b688fb415457bdb/iniconfig-2.3.1-py3-none-any.whl", hash = "sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7", size = 7552, upload-time = "2026-10-06T22:48:36.959Z" },
-]
-
-[[package]]
-name = "narwhals"
-version = "2.28.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/67/43/e11d75a7fb635c6f63dd6e176cb3e050ec2fee35f2f2267b332a6ad351ec/narwhals-2.28.0.tar.gz", hash = "sha256:2d9860c80d6610820826e94c6e42ce4b1d92d89cdd479586e652a8d211dab345", size = 754977, upload-time = "2026-10-27T12:19:33.777Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cf/82/8ef9c7e0f50493307a49c09cfa7f00c5a778b6d1921f7b2dabe1d3a5809e/narwhals-2.28.0-py3-none-any.whl", hash = "sha256:1f69d6385ec30e2fa6e1fdeb37c562ecabd0f713f6f3e3b58a668c5c9df9567f", size = 490591, upload-time = "2026-10-27T12:19:31.649Z" },
 ]
 
 [[package]]
@@ -388,10 +366,8 @@ wheels = [
 name = "pypersistable"
 source = { editable = "." }
 dependencies = [
-    { name = "anyschema" },
     { name = "duckdb" },
     { name = "fsspec" },
-    { name = "narwhals" },
     { name = "orjson" },
     { name = "pyarrow" },
     { name = "pydantic" },
@@ -410,10 +386,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anyschema", specifier = ">=0.4.0" },
     { name = "duckdb" },
     { name = "fsspec" },
-    { name = "narwhals", specifier = ">=2.28.0" },
     { name = "orjson" },
     { name = "pyarrow" },
     { name = "pydantic", specifier = ">2.0" },
