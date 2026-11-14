@@ -256,7 +256,10 @@ Parquet has no union type: other than `T | None`, unions must be a `Reference` (
 `DiscriminatedUnion`. Unsupported types raise `UnsupportedTypeError`.
 
 Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
-Renaming fields, or changing their types, is not supported.
+Changing a field's type is not supported: writing raises an `IncompatibleSchemaError` if it differs from that in the
+type's persisted files. So is removing (or renaming) a field of a type which forbids extra fields (pydantic's
+`extra="forbid"`), as its persisted objects could no longer be validated. Otherwise, a removed field's persisted data
+is ignored when read, with a warning (once per file).
 
 #### Custom types
 - `add_type(typ, arrow_type, to_arrow=None)`: store `typ` (and its subclasses) as `arrow_type`, with `to_arrow`

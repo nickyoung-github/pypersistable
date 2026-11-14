@@ -103,7 +103,9 @@ class ArrowConverter:
     def arrow_schema(self, typ: type) -> pa.Schema:
         """The schema of a struct-like type, e.g. a dataclass or pydantic model"""
         if (schema := self.__schemas.get(typ)) is None:
-            schema = self.__schemas[typ] = pa.schema(self.__struct_fields(typ))
+            if (hints := self.struct_fields(typ)) is None:
+                raise UnsupportedTypeError(f"Not a struct-like type: {typ}")
+            schema = self.__schemas[typ] = pa.schema(self.__arrow_fields(hints))
         return schema
 
     def arrow_type(self, hint: Any, metadata: tuple[Any, ...] = ()) -> pa.DataType:
@@ -143,8 +145,8 @@ class ArrowConverter:
                 return pa.decimal128(*_decimal_precision_scale(metadata))
             if (entry := self.__type_entry(hint)) is not None:
                 return entry[0]
-            if any(s(hint) is not None for s in self.__structs):
-                return pa.struct(self.__struct_fields(hint))
+            if (hints := self.struct_fields(hint)) is not None:
+                return pa.struct(self.__arrow_fields(hints))
 
         raise UnsupportedTypeError(f"Unsupported type {hint}")
 
@@ -187,8 +189,11 @@ class ArrowConverter:
         to_arrow = self.__to_arrow[typ]
         return value if to_arrow is None else to_arrow(value)
 
-    def __struct_fields(self, typ: type) -> list[pa.Field]:
-        hints = next(f for s in self.__structs if (f := s(typ)) is not None)
+    def struct_fields(self, typ: type) -> Mapping[str, Any] | None:
+        """The field type hints of a struct-like type, else None"""
+        return next((f for s in self.__structs if (f := s(typ)) is not None), None)
+
+    def __arrow_fields(self, hints: Mapping[str, Any]) -> list[pa.Field]:
         return [pa.field(name, self.arrow_type(hint)) for name, hint in hints.items()]
 
     def __type_entry(

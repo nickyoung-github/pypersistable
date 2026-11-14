@@ -23,14 +23,18 @@ class ReferenceResolver:
     """Resolves references when reading.
 
     An unresolved reference validates as its id and is added to pending, for the caller to load and re-validate.
+    If not resolve, references are left as their ids.
     """
 
-    def __init__(self):
+    def __init__(self, resolve: bool = True):
+        self.resolve = resolve
         self.resolved: dict[PersistableId, Persistable] = {}
         self.pending: set[PersistableId] = set()
         self.misses = 0
 
     def get(self, object_id: PersistableId) -> Persistable | PersistableId:
+        if not self.resolve:
+            return object_id
         if (obj := self.resolved.get(object_id)) is not None:
             return obj
 
@@ -107,6 +111,9 @@ class _Reference:
             serialiser: SerializerFunctionWrapHandler,
             info: SerializationInfo,
         ) -> Any:
+            if isinstance(value, PersistableId):
+                return str(value)  # Left unresolved by a ReferenceResolver
+
             collector: ReferenceCollector | None = (info.context or {}).get(COLLECTOR)
             if collector is None:
                 # Serialise by value, via the schema so that any context still applies

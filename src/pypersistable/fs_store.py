@@ -1,13 +1,16 @@
 import datetime as dt
+import warnings
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from types import NoneType, UnionType
-from typing import Any, Union, get_args, get_origin
+from typing import Annotated, Any, Union, get_args, get_origin
 from uuid import uuid4
 
 import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fsspec import url_to_fs
+from fsspec.implementations.local import LocalFileSystem
 from orjson import dumps
 
 from .arrow import ArrowConverter, UnsupportedTypeError
@@ -85,6 +88,50 @@ def _drop_absent(value: Any, arrow_type: pa.DataType, file_type: pa.DataType) ->
     return value
 
 
+def _differences(
+    arrow_type: pa.DataType, file_type: pa.DataType, path: tuple[str, ...] = ()
+) -> Iterator[tuple[tuple[str, ...], str | None]]:
+    # (path, type change) of the fields removed (None), or whose types have changed. Added fields are compatible: their
+    # defaults apply on reading
+    if arrow_type == file_type:
+        return
+    if pa.types.is_struct(arrow_type) and pa.types.is_struct(file_type):
+        fields = {f.name: f.type for f in arrow_type}
+        for f in file_type:
+            if f.name in fields:
+                yield from _differences(fields[f.name], f.type, (*path, f.name))
+            else:
+                yield (*path, f.name), None
+    elif pa.types.is_map(arrow_type) and pa.types.is_map(file_type):
+        yield from _differences(arrow_type.key_type, file_type.key_type, (*path, "key"))
+        yield from _differences(
+            arrow_type.item_type, file_type.item_type, (*path, "value")
+        )
+    elif pa.types.is_list(arrow_type) and pa.types.is_list(file_type):
+        yield from _differences(
+            arrow_type.value_type, file_type.value_type, (*path, "item")
+        )
+    else:
+        yield path, f"{arrow_type}, but {file_type} when persisted"
+
+
+def _unwrap(hint: Any) -> tuple[Any, tuple[Any, ...]]:
+    # The type and Annotated metadata of a hint, which, if a union, is persisted, so is T | None
+    metadata = ()
+    while True:
+        if get_origin(hint) is Annotated:
+            hint, *extra = get_args(hint)
+            metadata += tuple(extra)
+        elif get_origin(hint) in (Union, UnionType):
+            hint = next(a for a in get_args(hint) if a is not NoneType)
+        else:
+            return hint, metadata
+
+
+class IncompatibleSchemaError(TypeError):
+    """A type's schema is incompatible with that of its persisted objects: a field was removed or its type changed"""
+
+
 class FSStore(PersistableStore):
     def __init__(
         self,
@@ -100,6 +147,64 @@ class FSStore(PersistableStore):
         self.__root = Path(root)
         self.__conn = duckdb.connect()
         self.__conn.register_filesystem(self.__fs)
+        # Schemas of Parquet files by path, which are never rewritten
+        self.__file_types: dict[str, pa.StructType] = {}
+        self.__checked_files: set[str] = set()  # For ignored fields, when read
+
+    def __duckdb_path(self, path: str) -> str:
+        # duckdb uses the registered filesystem for paths with its protocol, and its own for local paths (faster)
+        return (
+            path
+            if isinstance(self.__fs, LocalFileSystem)
+            else self.__fs.unstrip_protocol(path)
+        )
+
+    def __differences(
+        self, typ: type[Persistable], file: str
+    ) -> tuple[list[str], list[str]]:
+        """The incompatible and the ignored (removed, but allowed as extra) fields of a Parquet file of typ"""
+        record_type = self.record_type(typ)
+        incompatible, ignored = [], []
+        arrow_type = pa.struct(self.__arrow.arrow_schema(record_type))
+        for path, change in _differences(arrow_type, self.__file_type(file)):
+            name = ".".join(path)
+            if change is not None:
+                incompatible.append(f"{name} is {change}")
+            elif self.__allows_extra(record_type, path[:-1]):
+                ignored.append(name)
+            else:
+                incompatible.append(f"{name} has been removed")
+        return incompatible, ignored
+
+    def __allows_extra(self, hint: Any, path: tuple[str, ...]) -> bool:
+        # Whether the struct-like type at path (as from _differences) within hint allows extra fields
+        for segment in path:
+            hint, metadata = _unwrap(hint)
+            if info := next(
+                (m for m in metadata if isinstance(m, DiscriminatedUnionInfo)), None
+            ):
+                hint = dict(info.members)[segment]
+            elif get_origin(hint) in (dict, Mapping):
+                hint = get_args(hint)[segment == "value"]
+            elif get_origin(hint) is not None:
+                hint = get_args(hint)[0]  # A collection
+            else:
+                hint = self.__arrow.struct_fields(hint)[segment]  # pyright: ignore[reportOptionalSubscript]
+
+        hint, metadata = _unwrap(hint)
+        if any(isinstance(m, DiscriminatedUnionInfo) for m in metadata):
+            return False  # A removed member's values could not be validated
+        config = getattr(hint, "model_config", None) or getattr(
+            hint, "__pydantic_config__", {}
+        )
+        return config.get("extra") != "forbid"
+
+    def __file_type(self, path: str) -> pa.StructType:
+        if (file_type := self.__file_types.get(path)) is None:
+            file_type = self.__file_types[path] = pa.struct(
+                pq.read_schema(path, filesystem=self.__fs)
+            )
+        return file_type
 
     def __directory(self, typ: type[Persistable]) -> Path:
         # Store root / TypeRegistry root / registered name
@@ -150,7 +255,7 @@ class FSStore(PersistableStore):
                     QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
                     """,
                     params=[
-                        files,
+                        self.__duckdb_path(files),
                         [str(i) for i in object_ids],
                         effective_time,
                         entry_time,
@@ -172,15 +277,19 @@ class FSStore(PersistableStore):
                     .to_pylist(maps_as_pydicts="strict")
                 )
                 filenames = table["filename"].to_pylist()
-                file_types = {
-                    f: pa.struct(pq.read_schema(f, filesystem=self.__fs))
-                    for f in set(filenames)
-                }
                 record_type = pa.struct(schema)
                 results[typ] = [
-                    _drop_absent(r, record_type, file_types[f])
+                    _drop_absent(r, record_type, self.__file_type(f))
                     for r, f in zip(records, filenames, strict=True)
                 ]
+
+                for f in set(filenames) - self.__checked_files:
+                    self.__checked_files.add(f)
+                    if ignored := self.__differences(typ, f)[1]:
+                        warnings.warn(
+                            f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
+                            stacklevel=2,
+                        )
             else:
                 results[typ] = [row for (row,) in relation.fetchall()]
 
@@ -193,13 +302,25 @@ class FSStore(PersistableStore):
     ):
         # Unique, as concurrent writers may share an entry time. Not ":", which some file systems disallow
         filename = f"{entry_time.isoformat().replace(':', '~')}-{uuid4().hex[:8]}"
+        parquet = self.record_format is RecordFormat.Parquet
+
+        if parquet:
+            # Before writing anything
+            for typ in by_type:
+                files = self.__fs.glob(f"{self.__directory(typ)}/**/*.parquet")
+                if problems := {
+                    p for f in files for p in self.__differences(typ, f)[0]
+                }:
+                    raise IncompatibleSchemaError(
+                        f"{typ.__qualname__}: {'; '.join(sorted(problems))}"
+                    )
 
         for typ, records in by_type.items():
             directory = self.__directory(typ)
             self.__fs.makedirs(directory, exist_ok=True)
             path = directory / filename
 
-            if self.record_format is RecordFormat.Parquet:
+            if parquet:
                 schema = self.__arrow.arrow_schema(self.record_type(typ))
                 table = pa.Table.from_pylist(
                     self.__arrow.arrow_value(records, pa.list_(pa.struct(schema))),

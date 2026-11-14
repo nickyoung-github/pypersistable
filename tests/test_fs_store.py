@@ -6,7 +6,7 @@ from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
 from ipaddress import IPv4Address
 from typing import Annotated, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import duckdb
 import pyarrow as pa
@@ -24,12 +24,13 @@ from models import (
     TradingBook,
     registry,
 )
-from pydantic import Field, NaiveDatetime
+from pydantic import ConfigDict, Field, NaiveDatetime
 
 from pypersistable import (
     FSStore,
     Identifiable,
     IdField,
+    IncompatibleSchemaError,
     RecordFormat,
     UnknownObjectError,
     UnsupportedTypeError,
@@ -192,8 +193,11 @@ def test_shared_references_are_written_once(store, spy):
 
 def test_unchanged_objects_and_references_are_not_rewritten(store, spy):
     store.write(shared_deals())
+    spy["reads"].clear()
     store.write(shared_deals())
     assert len(spy["writes"]) == 1
+    # One read to check: references are compared by id, so are not resolved
+    assert spy["reads"] == [{"Deal": 3, "Counterparty": 1, "TradingBook": 1}]
 
 
 def moved_acme_deal() -> Deal:
@@ -411,6 +415,14 @@ def test_different_objects_with_the_same_id_raise(store, tmp_path):
     )
 
 
+@pytest.mark.parametrize("record_format", list(RecordFormat), ids=lambda f: f.name)
+def test_non_local_filesystem(record_format):
+    store = FSStore(f"memory://{uuid4().hex}", record_format=record_format)
+    deals = shared_deals(2)
+    store.write(deals)
+    assert store.read([d.object_id for d in deals]) == {d.object_id: d for d in deals}
+
+
 def test_unusual_paths(tmp_path):
     store = FSStore(f"file://{tmp_path}/it's here")
     Node(name="a").write(store)
@@ -557,6 +569,71 @@ class Evolving(Identifiable):
 
 
 registry.register(Evolving.__name__, Evolving)
+
+
+def test_parquet_changed_field_type_raises(tmp_path):
+    url = f"file://{tmp_path}"
+    Evolving(name="a", added=1).write(FSStore(url))
+
+    # As if added were changed to a float
+    changed = persistable_arrow_converter()
+    changed.add_struct(
+        lambda t: {"name": IdField[str], "added": float} if t is Evolving else None
+    )
+    store = FSStore(url, arrow_converter=changed)
+    with pytest.raises(
+        IncompatibleSchemaError, match="data.added is double, but int64 when persisted"
+    ):
+        Evolving(name="b", added=2).write(store)
+    assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1  # Nothing written
+
+
+def test_parquet_removed_field_is_ignored(tmp_path):
+    url = f"file://{tmp_path}"
+    Evolving(name="a", added=1).write(FSStore(url))
+
+    # Evolving, a plain dataclass, ignores extra fields: added may be removed
+    removed = persistable_arrow_converter()
+    removed.add_struct(lambda t: {"name": IdField[str]} if t is Evolving else None)
+    store = FSStore(url, arrow_converter=removed)
+    Evolving(name="b").write(store)
+
+    with pytest.warns(UserWarning, match="ignoring data.added, removed from Evolving"):
+        assert Evolving.read(store, name="a") == Evolving(name="a")
+
+
+@dataclass
+class StrictInner:
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    x: int
+    y: int = 0
+
+
+@dataclass
+class HoldsStrict(Identifiable):
+    name: IdField[str]
+    inner: StrictInner
+    inners: list[StrictInner]
+
+
+registry.register(HoldsStrict.__name__, HoldsStrict)
+
+
+def test_parquet_removed_field_raises_if_extra_forbidden(tmp_path):
+    url = f"file://{tmp_path}"
+    HoldsStrict(name="a", inner=StrictInner(1), inners=[StrictInner(2)]).write(
+        FSStore(url)
+    )
+
+    removed = persistable_arrow_converter()
+    removed.add_struct(lambda t: {"x": int} if t is StrictInner else None)
+    with pytest.raises(
+        IncompatibleSchemaError,
+        match="data.inner.y has been removed; data.inners.item.y has been removed",
+    ):
+        HoldsStrict(name="b", inner=StrictInner(1), inners=[]).write(
+            FSStore(url, arrow_converter=removed)
+        )
 
 
 def test_parquet_added_field_defaults(tmp_path):

@@ -93,12 +93,20 @@ class PersistableStore(ObjectStore):
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
     ) -> dict[PersistableId, Persistable]:
+        return self.__read(object_ids, effective_time, entry_time, ReferenceResolver())
+
+    def __read(
+        self,
+        object_ids: Iterable[PersistableId],
+        effective_time: dt.datetime,
+        entry_time: dt.datetime,
+        resolver: ReferenceResolver,
+    ) -> dict[PersistableId, Persistable]:
         by_type: dict[type[Persistable], set[PersistableId]] = {}
         for object_id in object_ids:
             by_type.setdefault(object_id.typ, set()).add(object_id)
 
         ret: dict[PersistableId, Persistable] = {}
-        resolver = ReferenceResolver()
         context = {RESOLVER: resolver}
         unresolved = []  # Records with references, to validate again once those are loaded
 
@@ -204,7 +212,10 @@ class PersistableStore(ObjectStore):
         # Versions of the objects written or found unchanged
         versions: dict[PersistableId, dt.datetime] = {}
         conflicts: list[str] = []
-        current = self.read(records)
+        # References are left as ids, which is all the comparison needs: one read, rather than one per level
+        current = self.__read(
+            records, dt.datetime.max, dt.datetime.max, ReferenceResolver(resolve=False)
+        )
         check_context = (
             {**context, COLLECTOR: ReferenceCollector()} if by_reference else context
         )
