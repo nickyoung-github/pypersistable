@@ -145,12 +145,16 @@ def test_init_false(slots):
 @pytest.mark.parametrize("cls", (Plain, Slotted))
 def test_delete(cls):
     obj = cls(i=1)
-    del obj.i
-    if cls is Slotted:
-        with pytest.raises(AttributeError):
-            _ = obj.i
+    del obj.i, obj.s
+    # As for a dataclass: falls back to the default, if any
+    with pytest.raises(AttributeError):
+        _ = obj.i
+    if cls is Plain:
+        assert obj.s == "a"
     else:
-        assert "i" not in vars(obj)
+        # A slot, with no class attribute to fall back to
+        with pytest.raises(AttributeError):
+            _ = obj.s
     with pytest.raises(AttributeError):
         del obj.i
 
@@ -158,6 +162,16 @@ def test_delete(cls):
     assert obj.i == 2
     with pytest.raises(ValidationError):
         obj.i = "2"
+
+
+def test_class_attributes_are_defaults():
+    # As for a dataclass without slots
+    assert Plain.s == "a"
+    with pytest.raises(AttributeError):
+        _ = Plain.i
+    # Its default_factory's
+    with pytest.raises(AttributeError):
+        _ = Plain.ints
 
 
 def test_delete_init_false():

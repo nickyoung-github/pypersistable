@@ -40,19 +40,7 @@ class _ValidatingFieldDescriptor:
 
 
 class _DictFieldDescriptor(_ValidatingFieldDescriptor):
-    # No __get__, so reads find the value in the instance's __dict__ directly
-    def __set__(self, obj: Any, value: Any):
-        obj.__dict__[self._name] = self._validate(value)
-
-    def __delete__(self, obj: Any):
-        try:
-            del obj.__dict__[self._name]
-        except KeyError:
-            raise self._no_attribute() from None
-
-
-class _UninitialisedFieldDescriptor(_DictFieldDescriptor):
-    """A field which __init__ does not assign: reads of it unassigned fall back to its default, as for a dataclass"""
+    """Reads of the field unset, or of the class's attribute, fall back to its default, as for a dataclass"""
 
     def __init__(self, owner: type, name: str, default: Any):
         super().__init__(owner, name)
@@ -64,6 +52,15 @@ class _UninitialisedFieldDescriptor(_DictFieldDescriptor):
         if self.__default is MISSING:
             raise self._no_attribute()
         return self.__default
+
+    def __set__(self, obj: Any, value: Any):
+        obj.__dict__[self._name] = self._validate(value)
+
+    def __delete__(self, obj: Any):
+        try:
+            del obj.__dict__[self._name]
+        except KeyError:
+            raise self._no_attribute() from None
 
 
 class _SlotFieldDescriptor(_ValidatingFieldDescriptor):
@@ -143,10 +140,8 @@ def _install_descriptors(cls: type):
         ):
             # E.g. a property: it handles assignment itself
             continue
-        elif f.init or f.default_factory is not MISSING:
-            field = _DictFieldDescriptor(cls, f.name)
         else:
-            field = _UninitialisedFieldDescriptor(cls, f.name, f.default)
+            field = _DictFieldDescriptor(cls, f.name, f.default)
         setattr(cls, f.name, field)
 
     setattr(cls, _SCHEMA_HOOK, _SchemaHook(cls, vars(cls).get(_SCHEMA_HOOK)))

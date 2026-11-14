@@ -273,6 +273,10 @@ the new schema.
 As it reads one object per schema, it may miss incompatibilities in fields which happen to be empty (e.g. `None`) in
 that object. Validation of JSON is lax, so some type changes, e.g. from `int` to `float`, are compatible.
 
+Reading objects with a type whose schema has changed incompatibly, before any write has checked it, raises too: for
+Parquet an `IncompatibleSchemaError`, naming the changed fields of the file, and for JSON pydantic's
+`ValidationError`.
+
 ### JSON
 Records are written as a JSON array. `bytes` are base64-encoded.
 
@@ -354,7 +358,5 @@ hound.heads = "3"  # Raises pydantic.ValidationError: strict, so not coerced
   normally by custom pydantic validators are not
 - `ClassVar` and `InitVar` fields, and fields whose class attribute is a data descriptor (e.g. a property), are not
   validated
-- Without slots, a field's class attribute is the validating descriptor, not its default, and the default of an
-  `init=False` field, never assigned, is not validated. Nor, once deleted (`del obj.field`), does reading a field
-  fall back to its default or raise `AttributeError`: it reads as the descriptor, unless it is an `init=False` field
+- Without slots, the default of an `init=False` field that is never assigned is not validated
 - Combining with another metaclass (e.g. `ABCMeta`) requires one derived from both
