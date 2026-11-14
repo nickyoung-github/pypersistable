@@ -10,9 +10,11 @@ from anyschema import AnySchema
 from fsspec import url_to_fs
 from orjson import dumps
 
-from ._anyschema import PIPELINE
+from ._anyschema import PIPELINE, dataclass_fields
+from .persistable import Persistable
 from .persistable_id import PersistableId
 from .persistable_store import ObjectRecord, PersistableStore, RecordFormat
+from .type_registry import TypeRegistry
 
 
 class FSStore(PersistableStore):
@@ -26,15 +28,20 @@ class FSStore(PersistableStore):
     @classmethod
     @cache
     def __schema(cls, typ: type[ObjectRecord]) -> pa.Schema:
-        schema = AnySchema(spec=typ, pipeline=PIPELINE)
+        schema = AnySchema(spec=dataclass_fields(typ), pipeline=PIPELINE)
         return schema.to_arrow()
+
+    def __directory(self, typ: type[Persistable]) -> Path:
+        # Store root / TypeRegistry root / registered name
+        registry = TypeRegistry[Persistable]()
+        return self.__root / registry.root(typ) / registry.registered_name(typ)
 
     def _read(
         self,
-        by_directory: dict[Path, list[PersistableId]],
+        by_type: dict[type[Persistable], set[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
-    ) -> dict[Path, list[dict[str, Any]] | list[str]]:
+    ) -> dict[type[Persistable], list[dict[str, Any]] | list[str]]:
         results = {}
         parquet = self.record_format is RecordFormat.Parquet
 
@@ -54,12 +61,12 @@ class FSStore(PersistableStore):
                 for f in ("effective_time", "entry_time")
             )
 
-        for directory, object_ids in by_directory.items():
-            files = f"{self.__root.joinpath(directory)!s}/**/*"
+        for typ, object_ids in by_type.items():
+            files = f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
             source = (
-                f"read_parquet('{files}.parquet', union_by_name = true)"
+                f"read_parquet('{files}', union_by_name = true)"
                 if parquet
-                else f"read_json_objects('{files}.json', format = 'array')"
+                else f"read_json_objects('{files}', format = 'array')"
             )
 
             try:
@@ -75,10 +82,11 @@ class FSStore(PersistableStore):
                     params=[[str(i) for i in object_ids], effective_time, entry_time],
                 )
             except duckdb.IOException:
-                # This will happen if no objects of this type have been saved
+                if self.__fs.glob(files):
+                    raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
                 continue
 
-            results[directory] = (
+            results[typ] = (
                 relation.to_arrow_table().to_pylist()
                 if parquet
                 else [row for (row,) in relation.fetchall()]
@@ -86,25 +94,24 @@ class FSStore(PersistableStore):
 
         return results
 
-    def _write(self, records_by_path: dict[Path, list[dict[str, Any]]]):
-        for path, records in records_by_path.items():
-            if not records:
-                continue
+    def _write(
+        self,
+        by_type: dict[type[Persistable], list[dict[str, Any]]],
+        entry_time: dt.datetime,
+    ):
+        filename = entry_time.isoformat().replace(":", "~")
 
-            path = self.__root.joinpath(path)
-            typ = PersistableId.parse(records[0]["object_id"]).typ
+        for typ, records in by_type.items():
+            directory = self.__directory(typ)
+            self.__fs.makedirs(directory, exist_ok=True)
+            path = directory / filename
 
-            self.__fs.makedirs(path.parent, exist_ok=True)
-
-            match self.record_format:
-                case RecordFormat.Parquet:
-                    schema = self.__schema(self.record_type(typ))
-                    table = pa.Table.from_pylist(records, schema=schema)
-                    with pq.ParquetWriter(
-                        f"{path}.parquet", schema, filesystem=self.__fs
-                    ) as writer:
-                        writer.write_table(table)
-                case RecordFormat.Json:
-                    self.__fs.write_bytes(f"{path}.json", dumps(records))
-                case _:
-                    raise RuntimeError(f"Unsupported format {self.record_format}")
+            if self.record_format is RecordFormat.Parquet:
+                schema = self.__schema(self.record_type(typ))
+                table = pa.Table.from_pylist(records, schema=schema)
+                with pq.ParquetWriter(
+                    f"{path}.parquet", schema, filesystem=self.__fs
+                ) as writer:
+                    writer.write_table(table)
+            else:
+                self.__fs.write_bytes(f"{path}.json", dumps(records))

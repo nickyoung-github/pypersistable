@@ -61,7 +61,7 @@ class Persistable(ABC):
         return {
             **handler(source),
             "serialization": core_schema.wrap_serializer_function_ser_schema(serialise, info_arg=True),
-        }
+        } # pyright: ignore[reportReturnType]
 
     @classmethod
     @abstractmethod

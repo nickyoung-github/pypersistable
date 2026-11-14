@@ -4,14 +4,66 @@ from pydantic import GetCoreSchemaHandler
 from pydantic_core import CoreSchema
 from pydantic_core.core_schema import (
     SerializationInfo,
+    SerializerFunctionWrapHandler,
     ValidationInfo,
-    with_info_before_validator_function,
+    ValidatorFunctionWrapHandler,
+    with_info_wrap_validator_function,
     wrap_serializer_function_ser_schema,
 )
 
 from .persistable import Persistable
 from .persistable_id import PersistableId
-from .persistable_store import ReferenceResolver
+
+# Context keys
+RESOLVER = "resolver"
+COLLECTOR = "collector"
+
+
+class ReferenceResolver:
+    """Resolves references when reading.
+
+    An unresolved reference validates as its id and is added to pending, for the caller to load and re-validate.
+    """
+
+    def __init__(self):
+        self.resolved: dict[PersistableId, Persistable] = {}
+        self.pending: set[PersistableId] = set()
+        self.misses = 0
+
+    def get(self, object_id: PersistableId) -> Persistable | PersistableId:
+        if (obj := self.resolved.get(object_id)) is not None:
+            return obj
+
+        self.pending.add(object_id)
+        self.misses += 1
+        return object_id
+
+
+class ReferenceCollector:
+    """Collects referenced objects when writing, so that they are persisted too.
+
+    Each object's id is computed once, however often it is referenced.
+    """
+
+    def __init__(self):
+        # By id(obj), which is safe as the objects outlive the write
+        self.__ids: dict[int, PersistableId] = {}
+        self.__seen: set[PersistableId] = set()
+        self.__new: dict[PersistableId, Persistable] = {}
+
+    def add(self, obj: Persistable) -> PersistableId:
+        if (object_id := self.__ids.get(id(obj))) is None:
+            object_id = self.__ids[id(obj)] = obj.object_id
+            if object_id not in self.__seen:
+                self.__seen.add(object_id)
+                self.__new[object_id] = obj
+
+        return object_id
+
+    def take(self) -> dict[PersistableId, Persistable]:
+        """Objects added since the last take, by id"""
+        new, self.__new = self.__new, {}
+        return new
 
 
 class _Reference:
@@ -21,34 +73,38 @@ class _Reference:
     ) -> CoreSchema:
         schema = handler(source_type)
 
-        def resolver(info: SerializationInfo | ValidationInfo) -> ReferenceResolver:
-            ret = (info.context or {}).get("resolver")
-            if ret is None:
+        def validate(
+            value: Any, validator: ValidatorFunctionWrapHandler, info: ValidationInfo
+        ) -> Any:
+            if not isinstance(value, str | PersistableId):
+                return validator(value)  # An instance, or one persisted by value
+
+            resolver: ReferenceResolver | None = (info.context or {}).get(RESOLVER)
+            if resolver is None:
                 raise RuntimeError(
-                    "Need a context containiner {'resolver': ReferenceResolver} to resolve references"
+                    f"Need a context containing {{{RESOLVER!r}: ReferenceResolver}} to resolve references"
                 )
 
-            return ret
+            # A persisted reference: not validated as source_type, as it may resolve to its id for now
+            return resolver.get(
+                value
+                if isinstance(value, PersistableId)
+                else PersistableId.parse(value)
+            )
 
-        def validate(value: Any, info: ValidationInfo) -> Any:
-            if isinstance(value, source_type):
-                return value
-            elif not isinstance(value, str):
-                raise TypeError(
-                    f"Expected an object id or {source_type!s}, got {type(value)!s}"
-                )
-            return resolver(info).get(PersistableId.parse(value))
-
-        def serialise(value: Persistable, serialiser, info: SerializationInfo) -> Any:
-            try:
-                # Tell the resolver to persist the actual value
-                resolver(info).write(value)
-                return str(value.object_id)
-            except RuntimeError:
-                # No resolver: serialise by value, via the schema so that any context still applies
+        def serialise(
+            value: Persistable,
+            serialiser: SerializerFunctionWrapHandler,
+            info: SerializationInfo,
+        ) -> Any:
+            collector: ReferenceCollector | None = (info.context or {}).get(COLLECTOR)
+            if collector is None:
+                # Serialise by value, via the schema so that any context still applies
                 return serialiser(value)
 
-        return with_info_before_validator_function(
+            return str(collector.add(value))
+
+        return with_info_wrap_validator_function(
             validate,
             schema,
             serialization=wrap_serializer_function_ser_schema(
@@ -59,4 +115,4 @@ class _Reference:
 
 __REFERENCE = _Reference()
 T = TypeVar("T", bound=Persistable)
-Reference = Annotated[T | PersistableId, __REFERENCE]
+Reference = Annotated[T, __REFERENCE]

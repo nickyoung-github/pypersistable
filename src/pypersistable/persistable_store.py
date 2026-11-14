@@ -4,56 +4,15 @@ from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, make_dataclass
 from enum import Enum, auto
 from functools import cache
-from pathlib import Path
 from typing import Any
 
 from pydantic import TypeAdapter
 
+from .discriminated_union import STRUCT_LAYOUT
 from .object_store import ObjectStore
 from .persistable import Persistable
 from .persistable_id import PersistableId
-from .type_registry import TypeRegistry
-
-
-class ReferenceResolver:
-    def __init__(self, store: ObjectStore):
-        self.__store = store
-        self.__discovering = True
-        self.__pending_reads: set[PersistableId] = set()
-        self.__pending_writes: dict[PersistableId, Persistable] = {}
-        self.__resolved: dict[PersistableId, Persistable] = {}
-
-    def get(self, object_id: PersistableId):
-        if object_id in self.__resolved:
-            return self.__resolved[object_id]
-        elif self.__discovering:
-            self.__pending_reads.add(object_id)
-            return str(object_id)
-        raise RuntimeError(f"Failed to resolve {object_id}")
-
-    def write(self, obj: Persistable):
-        self.__pending_writes[obj.object_id] = obj
-
-    def take_pending_writes(self) -> tuple[Persistable, ...]:
-        pending_writes = tuple(self.__pending_writes.values())
-        self.__pending_writes = {}
-        return pending_writes
-
-    def resolve(self) -> bool:
-        self.__discovering = False
-
-        if not self.__pending_reads:
-            return False
-
-        loaded = self.__store.read(self.__pending_reads)
-        if len(loaded) < len(self.__pending_reads):
-            missing = self.__pending_reads.difference(loaded.keys())
-            raise RuntimeError(f"Failed to load {missing!r}")
-
-        self.__resolved.update(loaded)
-        self.__pending_reads = set()
-
-        return True
+from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolver
 
 
 @dataclass
@@ -86,34 +45,29 @@ class PersistableStore(ObjectStore):
 
     def _read(
         self,
-        by_directory: dict[Path, list[PersistableId]],
+        by_type: dict[type[Persistable], set[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
-    ) -> dict[Path, list[dict[str, Any]] | list[str]]:
-        """Records for the requested ids, by directory: raw JSON strings for RecordFormat.Json, else python objects"""
+    ) -> dict[type[Persistable], list[dict[str, Any]] | list[str]]:  # pyright: ignore[reportReturnType]
+        """The latest records for the requested ids: raw JSON strings for RecordFormat.Json, else python objects"""
 
-    def _write(self, records_by_path: dict[Path, list[dict[str, Any]]]): ...
+    def _write(
+        self,
+        by_type: dict[type[Persistable], list[dict[str, Any]]],
+        entry_time: dt.datetime,
+    ): ...
 
     @classmethod
     @cache
     def record_type(cls, typ: type[Persistable]) -> type[ObjectRecord]:
-        record_typ = make_dataclass(
-            f"{typ.__qualname__}Record",
-            fields=[
-                ("data", typ),
-            ],
-            bases=(ObjectRecord,),
+        return make_dataclass(
+            f"{typ.__qualname__}Record", [("data", typ)], bases=(ObjectRecord,)
         )
-        return record_typ
 
     @classmethod
     @cache
-    def type_adaptor(cls, typ: type[ObjectRecord]) -> TypeAdapter[ObjectRecord]:
-        return TypeAdapter(typ)
-
-    @classmethod
-    def type_registry(cls) -> TypeRegistry[Persistable]:
-        return TypeRegistry[Persistable]()
+    def __record_adapter(cls, typ: type[Persistable]) -> TypeAdapter[ObjectRecord]:
+        return TypeAdapter(cls.record_type(typ))
 
     def read(
         self,
@@ -121,45 +75,43 @@ class PersistableStore(ObjectStore):
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
     ) -> dict[PersistableId, Persistable]:
-        # Group the reads by directory, handle deserialisation, and resolve references
+        by_type: dict[type[Persistable], set[PersistableId]] = {}
+        for object_id in object_ids:
+            by_type.setdefault(object_id.typ, set()).add(object_id)
 
         ret: dict[PersistableId, Persistable] = {}
-        by_directory: dict[Path, list[PersistableId]] = {}
-        resolver_cache: dict[PersistableId, Persistable] = {}
-        type_registry = self.type_registry()
+        resolver = ReferenceResolver()
+        context = {RESOLVER: resolver}
+        unresolved = []  # Records with references, to validate again once those are loaded
 
-        for oid in object_ids:
-            if oid in resolver_cache:
-                ret[oid] = resolver_cache[oid]
-                continue
-
-            directory = type_registry.root(oid.typ).joinpath(oid.registered_name)
-            by_directory.setdefault(directory, []).append(oid)
-
-        all_results = self._read(by_directory, effective_time, entry_time)
-        for directory, results in all_results.items():
-            if not results:
-                continue
-
-            type_adaptor = self.type_adaptor(
-                self.record_type(by_directory[directory][0].typ)
-            )
+        for typ, results in self._read(by_type, effective_time, entry_time).items():
+            adapter = self.__record_adapter(typ)
             validate = (
-                type_adaptor.validate_json
+                adapter.validate_json
                 if self.__record_format is RecordFormat.Json
-                else type_adaptor.validate_python
+                else adapter.validate_python
             )
 
             for result in results:
-                resolver = ReferenceResolver(self)
-                context = {"resolver": resolver}
+                misses = resolver.misses
+                record = validate(result, context=context)  # pyright: ignore[reportArgumentType]
+                if resolver.misses > misses:
+                    unresolved.append((validate, result))
+                else:
+                    ret[PersistableId.parse(record.object_id)] = record.data
+
+        if unresolved:
+            # Load the references in one read, as of the same times, except those this read has already loaded
+            resolver.resolved.update(ret)
+            to_load = resolver.pending.difference(ret)
+            loaded = self.read(to_load, effective_time, entry_time) if to_load else {}
+            if missing := to_load.difference(loaded):
+                raise RuntimeError(f"Failed to load references {missing!r}")
+
+            resolver.resolved.update(loaded)
+            for validate, result in unresolved:
                 record = validate(result, context=context)
-
-                if resolver.resolve():
-                    record = validate(result, context=context)
-
-                object_id = PersistableId.parse(record.object_id)
-                resolver_cache[object_id] = ret[object_id] = record.data
+                ret[PersistableId.parse(record.object_id)] = record.data
 
         return ret
 
@@ -170,21 +122,13 @@ class PersistableStore(ObjectStore):
         check: bool = True,
         by_reference: bool = True,
     ):
-        # Construct and serialise the object record, group records by path
+        parquet = self.__record_format is RecordFormat.Parquet
+        if parquet and not by_reference:
+            raise ValueError(
+                "by_reference=False is not supported for RecordFormat.Parquet, which persists references as ids"
+            )
 
-        if check:
-            current = self.read(o.object_id for o in objects)
-            objects = [o for o in objects if current.get(o.object_id) != o]
-        else:
-            objects = list(objects)
-
-        if not objects:
-            return
-
-        type_registry = self.type_registry()
-        by_path: dict[Path, list[dict[str, Any]]] = {}
         entry_time = dt.datetime.now(dt.UTC)
-        filename = Path(f"{entry_time.isoformat()}".replace(":", "~"))
         metadata = MetaData(
             effective_time=effective_time
             if effective_time != dt.datetime.max
@@ -194,31 +138,51 @@ class PersistableStore(ObjectStore):
             user="nick",
         )
 
-        while objects:
-            obj = objects.pop()
-            object_id = obj.object_id
-            typ = type(obj)
-            directory = type_registry.root(typ).joinpath(object_id.registered_name)
-            path = directory.joinpath(filename)
-            record_type = self.record_type(typ)
-            type_adapter = self.type_adaptor(record_type)
-            record = record_type(
+        # Serialise the objects and, if by_reference, those they reference, collected as each is serialised
+        collector = ReferenceCollector()
+        for obj in objects:
+            collector.add(obj)
+
+        context: dict[str, Any] = {STRUCT_LAYOUT: parquet}
+        if by_reference:
+            context[COLLECTOR] = collector
+
+        def dump(object_id: PersistableId, obj: Persistable, context: dict[str, Any]):
+            record = self.record_type(type(obj))(
                 object_id=str(object_id),
                 metadata=metadata,
                 data=obj,  # pyright: ignore[reportCallIssue]
             )
-            resolver = ReferenceResolver(self)
-            context = {"resolver": resolver} if by_reference else None
-            data = type_adapter.dump_python(
-                record,
-                mode="json" if self.__record_format is RecordFormat.Json else "python",
-                context=context,
+            return self.__record_adapter(type(obj)).dump_python(
+                record, mode="python" if parquet else "json", context=context
             )
 
-            objects.extend(resolver.take_pending_writes())
-            by_path.setdefault(path, []).append(data)
+        records: dict[PersistableId, dict[str, Any]] = {}
+        while new := collector.take():
+            for object_id, obj in new.items():
+                records[object_id] = dump(object_id, obj, context)
 
-        self._write(by_path)
+        if check:
+            # Compare serialised data, in which references are ids: a change to a referenced object is not a change
+            current = self.read(records)
+            check_context = (
+                {**context, COLLECTOR: ReferenceCollector()}
+                if by_reference
+                else context
+            )
+            records = {
+                i: record
+                for i, record in records.items()
+                if i not in current
+                or dump(i, current[i], check_context)["data"] != record["data"]
+            }
+
+        by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
+        for object_id, record in records.items():
+            by_type.setdefault(object_id.typ, []).append(record)
+
+        if by_type:
+            self._write(by_type, entry_time)
 
     @staticmethod
     def read_all(

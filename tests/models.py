@@ -1,6 +1,5 @@
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass
-from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -94,9 +93,28 @@ class Cat:
 @dataclass(frozen=True, kw_only=True)
 class Kennel(Identifiable):
     name: IdField[str]
+    pet: DiscriminatedUnion[Dog, Cat, int]  # pyright: ignore[reportInvalidTypeForm]
+
+
+@dataclass(frozen=True, kw_only=True)
+class Deal(Identifiable):
+    deal_id: IdField[str]
+    counterparty: Reference[Counterparty]
+    book: Reference[TradingBook | Counterparty]
+    backup: Reference[Counterparty] | None = None
+    others: tuple[Reference[Counterparty], ...] = ()
+
+
+class ModelDeal(Identifiable, BaseModel):
+    deal_id: IdField[str]
+    counterparty: Reference[Counterparty]
     pet: DiscriminatedUnion[Dog, Cat]  # pyright: ignore[reportInvalidTypeForm]
-    fee: Decimal = Decimal(0)
-    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class PlainUnion(Identifiable):
+    name: IdField[str]
+    value: int | str
 
 
 for _typ in (
@@ -112,6 +130,9 @@ for _typ in (
     Pair,
     Scaled,
     Kennel,
+    Deal,
+    ModelDeal,
+    PlainUnion,
 ):
     registry.register(_typ.__name__, _typ)
 
