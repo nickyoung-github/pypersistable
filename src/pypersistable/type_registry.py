@@ -79,10 +79,21 @@ class TypeRegistry[T]:
         except KeyError:
             raise UnregisteredTypeError(root)
 
-    def register(self, name: str, typ: type[T] | EntryPoint, root=Path()):
+    def register(
+        self, name: str, typ: type[T] | EntryPoint, root=Path(), replace: bool = False
+    ):
+        """replace: replace the type registered as name, if any, e.g. with a redefinition of it"""
         type_info = self.__by_name.get(name)
         if type_info is not None:
-            raise RegistrationError(name, type_info.resolved_type)
+            if not replace:
+                raise RegistrationError(name, type_info.resolved_type)
+
+            del self.__by_name[name]
+            self.__by_root[type_info.root].remove(type_info)
+            if isinstance(type_info.typ, EntryPoint):
+                del self.__by_type_name[type_info.typ.value]
+            else:
+                del self.__by_type[type_info.typ]
 
         try:
             type_info = self.__type_info(typ)

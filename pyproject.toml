@@ -2,7 +2,7 @@
 
 [project]
 name = "pypersistable"
-description = "Core Object Model"
+description = "Persistable Python Object Model"
 authors = [
     {name = "Nick Young", email = "nick.young.github@gmail.com"}
 ]
@@ -22,7 +22,6 @@ classifiers = [
 dynamic = ["version"]
 
 dependencies = [
-    "anyschema>=0.4.0",
     "duckdb",
     "fsspec",
     "orjson",
@@ -37,11 +36,16 @@ test = [
 ]
 
 [project.urls]
-homepage = "https://github.com/nickyoung-github/persistable"
+homepage = "https://github.com/nickyoung-github/pypersistable"
 
 [build-system]
 requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
-version_file = "persistable/_version.py"
+version_file = "src/pypersistable/_version.py"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+]
