@@ -124,6 +124,19 @@ class Node(Identifiable):
     next: "Reference[Node] | None" = None
 
 
+@dataclass
+class IdNode(Identifiable):
+    # Mutable, so that a reference cycle in id fields can be made
+    name: IdField[str]
+    parent: "IdField[Reference[IdNode] | None]" = None
+
+
+@dataclass
+class HoldsIdNode(Identifiable):
+    name: IdField[str]
+    node: Reference[IdNode]
+
+
 class NoIds(Identifiable):
     other: "NoIds | None" = None  # A forward reference, deferring the id field check
 
@@ -145,6 +158,8 @@ for _typ in (
     ModelDeal,
     PlainUnion,
     Node,
+    IdNode,
+    HoldsIdNode,
 ):
     registry.register(_typ.__name__, _typ)
 

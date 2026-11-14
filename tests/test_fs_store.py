@@ -18,6 +18,8 @@ from models import (
     CustomerBook,
     Deal,
     Dog,
+    HoldsIdNode,
+    IdNode,
     Kennel,
     ModelDeal,
     Node,
@@ -268,7 +270,7 @@ def test_delete(store):
     node = Node(name="a")
     node.write(store)
     before = dt.datetime.now(dt.UTC)
-    node.delete(store, effective_time=before + dt.timedelta(days=1))
+    node.del_(store, effective_time=before + dt.timedelta(days=1))
 
     with pytest.raises(UnknownObjectError):
         Node.read(store, name="a")
@@ -277,6 +279,17 @@ def test_delete(store):
     # Its data is kept: found as of before it was deleted, by either time
     assert Node.read(store, name="a", entry_time=before) == node
     assert Node.read(store, name="a", effective_time=before) == node
+
+
+def test_delete_by_id_fields(strict_store):
+    node = Node(name="a")
+    node.write(strict_store)
+    # Reads it first, so it may be deleted from a store requiring a load of existing objects
+    Node.delete(strict_store, name="a")
+    with pytest.raises(UnknownObjectError):
+        Node.read(strict_store, name="a")
+    with pytest.raises(UnknownObjectError):
+        Node.delete(strict_store, name="a")
 
 
 def test_parquet_records_written_before_active(tmp_path):
@@ -295,23 +308,23 @@ def test_parquet_records_written_before_active(tmp_path):
 
 
 def test_delete_ignores_unpersisted_and_deleted(store, spy):
-    Node(name="a").delete(store)
+    Node(name="a").del_(store)
     node = Node(name="b")
     node.write(store)
-    node.delete(store)
-    node.delete(store)
+    node.del_(store)
+    node.del_(store)
     assert spy["writes"] == [{"Node": 1}, {"Node": 1}]
 
 
 def test_write_restores_deleted(store):
     node = Node(name="a")
     node.write(store)
-    node.delete(store)
+    node.del_(store)
     node.write(store)  # Unchanged, but restored
     assert Node.read(store, name="a") == node
 
     # Also by an object constructed anew
-    Node.read(store, name="a").delete(store)
+    Node.read(store, name="a").del_(store)
     restored = Node(name="a", next=Node(name="b"))
     restored.write(store)
     assert Node.read(store, name="a") == restored
@@ -324,9 +337,9 @@ def test_delete_out_of_date_raises(store):
     theirs.write(store)
 
     with pytest.raises(WriteConflictError, match="Node/.* was written at"):
-        mine.delete(store)
+        mine.del_(store)
     with pytest.warns(UserWarning, match="Overwriting"):
-        mine.delete(store, force_overwrite=True)
+        mine.del_(store, force_overwrite=True)
     with pytest.raises(UnknownObjectError):
         Node.read(store, name="a")
 
@@ -334,7 +347,7 @@ def test_delete_out_of_date_raises(store):
 def test_reference_to_deleted_resolves(store):
     head = Node(name="a", next=Node(name="b"))
     head.write(store)
-    head.next.delete(store)
+    head.next.del_(store)
 
     with pytest.raises(UnknownObjectError):
         Node.read(store, name="b")
@@ -344,7 +357,7 @@ def test_reference_to_deleted_resolves(store):
 def test_write_restores_deleted_reference(store, spy):
     head = Node(name="a", next=Node(name="b"))
     head.write(store)
-    head.next.delete(store)
+    head.next.del_(store)
 
     # Unchanged itself, but writes the deleted object it references, restoring it
     head.write(store)
@@ -355,9 +368,9 @@ def test_write_restores_deleted_reference(store, spy):
 def test_require_load_of_existing_delete(strict_store):
     Node(name="a").write(strict_store)
     with pytest.raises(WriteConflictError, match="was not read"):
-        Node(name="a").delete(strict_store)
+        Node(name="a").del_(strict_store)
 
-    Node.read(strict_store, name="a").delete(strict_store)
+    Node.read(strict_store, name="a").del_(strict_store)
     restored = Node(name="a", next=Node(name="b"))
     restored.write(strict_store)  # A deleted object may be restored without reading it
     assert Node.read(strict_store, name="a") == restored
@@ -512,6 +525,16 @@ def test_self_reference(store):
     head = Node(name="a", next=Node(name="b", next=Node(name="c")))
     head.write(store)
     assert Node.read(store, name="a") == head
+
+
+def test_referenced_id_field_reference_cycle_raises(store):
+    a, b = IdNode("a"), IdNode("b")
+    a.parent, b.parent = b, a
+    # a's id is computed serialising the object referencing it: raised as is, not wrapped by pydantic
+    with pytest.raises(
+        ValueError, match="^Reference cycle in id fields: IdNode -> IdNode -> IdNode$"
+    ):
+        HoldsIdNode(name="h", node=a).write(store)
 
 
 @pytest.mark.parametrize("length", [1, 2, 3])

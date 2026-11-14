@@ -41,10 +41,6 @@ IdField = Annotated[T, _IdFieldIndicator]
 _ID_ONLY = "id_only"
 
 
-class _IdCycleError(ValueError):
-    """A reference cycle in id fields: an object's id would depend on itself"""
-
-
 # The objects whose ids are being computed, outermost first
 _COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", default=())
 
@@ -119,7 +115,8 @@ class Persistable(ABC):
             cycle = " -> ".join(
                 type(o).__qualname__ for o in (*computing[start:], self)
             )
-            raise _IdCycleError(f"Reference cycle in id fields: {cycle}")
+            # Raised as is through the serialisers of the objects referencing self, unlike other exceptions
+            raise PydanticSerializationError(f"Reference cycle in id fields: {cycle}")
 
         token = _COMPUTING_IDS.set((*computing, self))
         try:
@@ -129,11 +126,6 @@ class Persistable(ABC):
                 if isinstance(self, id_type)
                 else {f.name: getattr(self, f.name) for f in fields(id_type)}
             )
-        except PydanticSerializationError as e:
-            # Raised computing a nested object's id, within serialisation: re-raised as is, rather than wrapped
-            if isinstance(e.__cause__, _IdCycleError):
-                raise e.__cause__ from None
-            raise
         finally:
             _COMPUTING_IDS.reset(token)
 
@@ -142,6 +134,7 @@ class Persistable(ABC):
     def read(
         cls,
         db: ObjectStore,
+        /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
@@ -154,6 +147,7 @@ class Persistable(ABC):
     def read(
         cls,
         db: ObjectStore,
+        /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
@@ -165,6 +159,7 @@ class Persistable(ABC):
     def read(
         cls,
         db: ObjectStore,
+        /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
@@ -198,7 +193,20 @@ class Persistable(ABC):
             by_reference=by_reference,
         )
 
+    @classmethod
     def delete(
+        cls,
+        db: ObjectStore,
+        /,
+        *,
+        effective_time: dt.datetime = dt.datetime.max,
+        force_overwrite: bool = False,
+        **kwargs,
+    ) -> None:
+        """Reads the object with the given id fields, then deletes it: see del_"""
+        cls.read(db, **kwargs).del_(db, effective_time, force_overwrite)
+
+    def del_(
         self,
         db: ObjectStore,
         effective_time: dt.datetime = dt.datetime.max,

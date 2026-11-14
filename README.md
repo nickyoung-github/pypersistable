@@ -225,15 +225,16 @@ loaded = store.read([best_boy.object_id, blofeld.object_id])
 ```
 
 ### Deleting
-`Persistable.delete` (or `ObjectStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
+`Persistable.del_` (or `ObjectStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
 a new version of their persisted data with `active=False`. Reads no longer find them, but their data is kept: reads
 as of earlier times still do, and references to them still resolve. Writing a deleted object again restores it,
 as does writing an object which references it.
 
 ```python
-best_boy.delete(store)
+best_boy.del_(store)
 Dog.read(store, name="Cerberus")  # Raises UnknownObjectError
 best_boy.write(store)  # Restored
+Dog.delete(store, name="Cerberus")  # Reads it, then deletes it: raises UnknownObjectError if not found
 ```
 
 Deleting is checked for conflicts as writing is, and objects not persisted, or already deleted, are ignored.
@@ -246,6 +247,9 @@ methods to read the latest version as of those times:
 ```python
 Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))  # As we knew it on 1 January
 ```
+
+An object read as of an earlier `entry_time` is out of date if it has since been rewritten, so writing it back
+raises a `WriteConflictError` (see [Overwriting](#overwriting)).
 
 ### Schema evolution
 Fields may be added to a type, with defaults, which apply when reading objects written before they were added.

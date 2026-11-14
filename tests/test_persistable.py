@@ -7,6 +7,7 @@ from models import (
     Counterparty,
     CustomerBook,
     DictStore,
+    IdNode,
     ModelAddress,
     ModelBook,
     ModelCounterparty,
@@ -17,7 +18,6 @@ from models import (
     Scaled,
     Thing,
     TradingBook,
-    registry,
 )
 from orjson import OPT_SORT_KEYS, dumps
 from pydantic import TypeAdapter, ValidationError
@@ -26,7 +26,6 @@ from pypersistable import (
     Identifiable,
     IdField,
     PersistableId,
-    Reference,
     Unique,
     UnknownObjectError,
 )
@@ -165,15 +164,6 @@ def test_identifiable_without_id_fields_raises():
             name: str
 
 
-@dataclass
-class IdNode(Identifiable):
-    name: IdField[str]
-    parent: "IdField[Reference[IdNode] | None]" = None
-
-
-registry.register(IdNode.__name__, IdNode)
-
-
 def test_id_field_reference_chain():
     assert IdNode("a", parent=IdNode("b")).object_id != IdNode("a").object_id
 
@@ -185,7 +175,7 @@ def test_id_field_reference_cycle_raises(length):
         node.parent = parent
 
     cycle = " -> ".join(["IdNode"] * (length + 1))
-    with pytest.raises(ValueError, match=f"Reference cycle in id fields: {cycle}$"):
+    with pytest.raises(ValueError, match=f"^Reference cycle in id fields: {cycle}$"):
         _ = nodes[0].object_id
 
 
