@@ -188,6 +188,11 @@ class PersistableStore(ObjectStore):
                 collector.referrer = object_id
                 records[object_id] = dump(object_id, obj, context)
 
+        if collector.conflicts:
+            raise ValueError(
+                f"Different objects with the same id: {', '.join(map(str, collector.conflicts))}"
+            )
+
         try:
             TopologicalSorter(collector.graph).prepare()
         except CycleError as e:
@@ -196,9 +201,8 @@ class PersistableStore(ObjectStore):
                 f"Reference cycle: {' -> '.join(map(str, e.args[1]))}"
             ) from None
 
-        versions: dict[
-            PersistableId, dt.datetime
-        ] = {}  # Of the objects written or found unchanged
+        # Versions of the objects written or found unchanged
+        versions: dict[PersistableId, dt.datetime] = {}
         conflicts: list[str] = []
         current = self.read(records)
         check_context = (

@@ -392,6 +392,31 @@ def test_reference_cycle_raises(store, tmp_path, length):
     assert not [p for p in tmp_path.rglob("*") if p.is_file()]  # Nothing written
 
 
+def test_different_objects_with_the_same_id_raise(store, tmp_path):
+    deal = Deal(
+        deal_id="D",
+        counterparty=Counterparty(name="Acme", location="NW3"),
+        book=TradingBook(name="B"),
+        backup=Counterparty(name="Acme", location="SW1"),
+    )
+    with pytest.raises(
+        ValueError, match="Different objects with the same id: Counterparty/"
+    ):
+        store.write([deal])
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()]  # Nothing written
+
+    # Equal objects are fine
+    Deal(**{**vars(deal), "backup": Counterparty(name="Acme", location="NW3")}).write(
+        store
+    )
+
+
+def test_unusual_paths(tmp_path):
+    store = FSStore(f"file://{tmp_path}/it's here")
+    Node(name="a").write(store)
+    assert Node.read(store, name="a") == Node(name="a")
+
+
 def test_plain_union(store):
     plain = PlainUnion(name="p", value="text")
     if store.record_format is RecordFormat.Parquet:

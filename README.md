@@ -121,7 +121,7 @@ Animals = DiscriminatedUnion[TypeRegistry().types_for_root(Path("Animals"))]
 A file system-based store, `FSStore`, is provided. Objects are written into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
 Each write creates a new file per type, named by the timestamp of the write, which corresponds to
-`entry_time` in the persisted record's metadata.
+`entry_time` in the persisted record's metadata, and a unique suffix, as concurrent writers may share a timestamp.
 
 Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.
@@ -146,7 +146,7 @@ Will result in:
 /users/hades/ObjectStore                               # FSStore root
     /Animals                                           # TypeRegistry root
         /Dog                                           # TypeRegistry registered_name
-            /2026-11-08T13~01~55.249821+00~00.parquet  # File name (: is replaced, as not valid on all file systems)
+            /2026-11-08T13~01~55.249821+00~00-3f9c1a2b.parquet  # Entry time (: is not valid on all file systems) and a unique suffix
 ```
 
 If you save an object which contains references, multiple objects may be written:
@@ -170,9 +170,9 @@ This would create:
 ```
 /users/hades/ObjectStore                           # FSStore root
     /Customer                                      # TypeRegistry registered_name
-        /2026-11-08T13~01~55.249821+00~00.parquet  # File name
+        /2026-11-08T13~01~55.249821+00~00-3f9c1a2b.parquet  # File name
     /Address                                       # TypeRegistry registered_name
-        /2026-11-08T13~01~55.249821+00~00.parquet  # File name
+        /2026-11-08T13~01~55.249821+00~00-3f9c1a2b.parquet  # File name
 ```
 
 #### Overwriting

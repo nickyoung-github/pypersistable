@@ -2,7 +2,7 @@
 
 [project]
 name = "pypersistable"
-description = "Core Object Model"
+description = "Persistable Python Object Model"
 authors = [
     {name = "Nick Young", email = "nick.young.github@gmail.com"}
 ]

@@ -2,6 +2,7 @@ import datetime as dt
 from pathlib import Path
 from types import NoneType, UnionType
 from typing import Any, Union, get_args, get_origin
+from uuid import uuid4
 
 import duckdb
 import pyarrow as pa
@@ -133,9 +134,9 @@ class FSStore(PersistableStore):
         for typ, object_ids in by_type.items():
             files = f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
             source = (
-                f"read_parquet('{files}', union_by_name = true, filename = true)"
+                "read_parquet(?, union_by_name = true, filename = true)"
                 if parquet
-                else f"read_json_objects('{files}', format = 'array')"
+                else "read_json_objects(?, format = 'array')"
             )
 
             try:
@@ -148,7 +149,12 @@ class FSStore(PersistableStore):
                     AND {entry} <= ?
                     QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
                     """,
-                    params=[[str(i) for i in object_ids], effective_time, entry_time],
+                    params=[
+                        files,
+                        [str(i) for i in object_ids],
+                        effective_time,
+                        entry_time,
+                    ],
                 )
             except duckdb.IOException:
                 if self.__fs.glob(files):
@@ -185,7 +191,8 @@ class FSStore(PersistableStore):
         by_type: dict[type[Persistable], list[dict[str, Any]]],
         entry_time: dt.datetime,
     ):
-        filename = entry_time.isoformat().replace(":", "~")
+        # Unique, as concurrent writers may share an entry time. Not ":", which some file systems disallow
+        filename = f"{entry_time.isoformat().replace(':', '~')}-{uuid4().hex[:8]}"
 
         for typ, records in by_type.items():
             directory = self.__directory(typ)

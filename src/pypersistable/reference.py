@@ -43,23 +43,27 @@ class ReferenceCollector:
     """Collects referenced objects when writing, so that they are persisted too.
 
     Each object's id is computed once, however often it is referenced. Set referrer to the id of the object being
-    serialised to record what it references in graph.
+    serialised to record what it references in graph. Ids of unequal objects sharing them are added to conflicts.
     """
 
     def __init__(self):
         # By id(obj), which is safe as the objects outlive the write
         self.__ids: dict[int, PersistableId] = {}
-        self.__seen: set[PersistableId] = set()
+        self.__objects: dict[PersistableId, Persistable] = {}
         self.__new: dict[PersistableId, Persistable] = {}
         self.referrer: PersistableId | None = None
         self.graph: dict[PersistableId, set[PersistableId]] = {}
+        self.conflicts: set[PersistableId] = set()
 
     def add(self, obj: Persistable) -> PersistableId:
         if (object_id := self.__ids.get(id(obj))) is None:
             object_id = self.__ids[id(obj)] = obj.object_id
-            if object_id not in self.__seen:
-                self.__seen.add(object_id)
-                self.__new[object_id] = obj
+            if (existing := self.__objects.get(object_id)) is None:
+                self.__objects[object_id] = self.__new[object_id] = obj
+            elif existing != obj:
+                self.conflicts.add(
+                    object_id
+                )  # Not raised here, as pydantic would wrap the error
 
         if self.referrer is not None:
             self.graph.setdefault(self.referrer, set()).add(object_id)
