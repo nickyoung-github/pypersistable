@@ -1,6 +1,7 @@
 import datetime as dt
 import warnings
 from collections.abc import Iterator, Mapping
+from itertools import pairwise
 from pathlib import Path
 from types import NoneType, UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
@@ -11,14 +12,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fsspec import url_to_fs
 from fsspec.implementations.local import LocalFileSystem
-from orjson import dumps
+from orjson import dumps, loads
+from pydantic import ValidationError
 
 from .arrow import ArrowConverter, UnsupportedTypeError
 from .discriminated_union import TAG_FIELD, DiscriminatedUnionInfo
 from .persistable import Persistable
 from .persistable_id import PersistableId
 from .persistable_store import PersistableStore, RecordFormat
-from .reference import _Reference
+from .reference import ReferenceResolver, _Reference
 from .type_registry import TypeRegistry
 
 
@@ -62,6 +64,12 @@ def persistable_arrow_converter() -> ArrowConverter:
 
 
 _ARROW_CONVERTER = persistable_arrow_converter()
+_SCHEMA_SUFFIX = ".jsonschema"
+
+
+def _entry_time(filename: str) -> dt.datetime:
+    # Of a file named by _write: <entry time, with ":" replaced by "~">-<unique suffix>.<extension>
+    return dt.datetime.fromisoformat(filename.rpartition("-")[0].replace("~", ":"))
 
 
 def _drop_absent(value: Any, arrow_type: pa.DataType, file_type: pa.DataType) -> Any:
@@ -150,6 +158,8 @@ class FSStore(PersistableStore):
         # Schemas of Parquet files by path, which are never rewritten
         self.__file_types: dict[str, pa.StructType] = {}
         self.__checked_files: set[str] = set()  # For ignored fields, when read
+        # Types whose schemas have been checked, on their first write. A redefined type is checked again
+        self.__checked_types: set[type[Persistable]] = set()
 
     def __duckdb_path(self, path: str) -> str:
         # duckdb uses the registered filesystem for paths with its protocol, and its own for local paths (faster)
@@ -211,93 +221,123 @@ class FSStore(PersistableStore):
         registry = TypeRegistry[Persistable]()
         return self.__root / registry.root(typ) / registry.registered_name(typ)
 
+    def __query(
+        self,
+        conn: duckdb.DuckDBPyConnection,
+        typ: type[Persistable],
+        where: str,
+        params: list[Any],
+    ) -> list[dict[str, Any]] | list[str]:
+        """Records of typ, as _read returns them, meeting where, a condition on {object_id}, {effective_time} and
+        {entry_time}"""
+        parquet = self.record_format is RecordFormat.Parquet
+        files = f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
+        if parquet:
+            select, source = (
+                "*",
+                "read_parquet(?, union_by_name = true, filename = true)",
+            )
+            columns = {"object_id": "object_id"} | {
+                f: f"metadata.{f}" for f in ("effective_time", "entry_time")
+            }
+        else:
+            # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
+            select, source = "json", "read_json_objects(?, format = 'array')"
+            columns = {"object_id": "json->>'$.object_id'"} | {
+                f: f"(json->>'$.metadata.{f}')::TIMESTAMPTZ"
+                for f in ("effective_time", "entry_time")
+            }
+
+        try:
+            relation = conn.sql(
+                f"SELECT {select} FROM {source} WHERE {where.format(**columns)}",
+                params=[self.__duckdb_path(files), *params],
+            )
+        except duckdb.IOException:
+            if self.__fs.glob(files):
+                raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
+            return []
+
+        if not parquet:
+            return [row for (row,) in relation.fetchall()]
+
+        # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own time zone
+        schema = self.__arrow.arrow_schema(self.record_type(typ))
+        table = relation.to_arrow_table()
+        records = (
+            table.select(schema.names).cast(schema).to_pylist(maps_as_pydicts="strict")
+        )
+        filenames = table["filename"].to_pylist()
+
+        for f in set(filenames) - self.__checked_files:
+            self.__checked_files.add(f)
+            if ignored := self.__differences(typ, f)[1]:
+                warnings.warn(
+                    f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
+                    stacklevel=2,
+                )
+
+        record_type = pa.struct(schema)
+        return [
+            _drop_absent(r, record_type, self.__file_type(f))
+            for r, f in zip(records, filenames, strict=True)
+        ]
+
     def _read(
         self,
         by_type: dict[type[Persistable], set[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
     ) -> dict[type[Persistable], list[dict[str, Any]] | list[str]]:
-        results = {}
-        parquet = self.record_format is RecordFormat.Parquet
-
-        if parquet:
-            select, object_id, effective, entry = (
-                "*",
-                "object_id",
-                "metadata.effective_time",
-                "metadata.entry_time",
-            )
-        else:
-            # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
-            select = "json"
-            object_id = "json->>'$.object_id'"
-            effective, entry = (
-                f"(json->>'$.metadata.{f}')::TIMESTAMPTZ"
-                for f in ("effective_time", "entry_time")
-            )
-
+        latest = (
+            "{object_id} IN (SELECT unnest(?)) AND {effective_time} <= ? AND {entry_time} <= ? "
+            "QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry_time} DESC) = 1"
+        )
         # A cursor per read, as reads may run concurrently (see ReadBatch), which a connection does not support
         with self.__conn.cursor() as conn:
-            for typ, object_ids in by_type.items():
-                files = (
-                    f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
+            return {
+                typ: self.__query(
+                    conn,
+                    typ,
+                    latest,
+                    [[str(i) for i in ids], effective_time, entry_time],
                 )
-                source = (
-                    "read_parquet(?, union_by_name = true, filename = true)"
-                    if parquet
-                    else "read_json_objects(?, format = 'array')"
+                for typ, ids in by_type.items()
+            }
+
+    def __check_schema(self, typ: type[Persistable], filename: str):
+        """On this store's first write of typ: checks it can read the objects persisted, if its schema has changed since
+        they were written, recording its new JSON schema"""
+        directory = self.__directory(typ)
+        schema = self._json_schema(typ)
+        versions = sorted(self.__fs.glob(f"{directory}/*{_SCHEMA_SUFFIX}"))
+        if versions and loads(self.__fs.cat_file(versions[-1])) == schema:
+            return
+
+        if self.record_format is RecordFormat.Parquet:
+            files = self.__fs.glob(f"{directory}/**/*.parquet")
+            if problems := {p for f in files for p in self.__differences(typ, f)[0]}:
+                raise IncompatibleSchemaError(
+                    f"{typ.__qualname__}: {'; '.join(sorted(problems))}"
                 )
 
-                try:
-                    relation = conn.sql(
-                        f"""
-                        SELECT {select}
-                        FROM {source}
-                        WHERE {object_id} IN (SELECT unnest(?))
-                        AND {effective} <= ?
-                        AND {entry} <= ?
-                        QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
-                        """,
-                        params=[
-                            self.__duckdb_path(files),
-                            [str(i) for i in object_ids],
-                            effective_time,
-                            entry_time,
-                        ],
-                    )
-                except duckdb.IOException:
-                    if self.__fs.glob(files):
-                        raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
-                    continue
+        # The latest object written under each schema (or before the first recorded)
+        starts = [_entry_time(Path(v).name) for v in versions]
+        latest = (
+            "{entry_time} >= ? AND {entry_time} < ? ORDER BY {entry_time} DESC LIMIT 1"
+        )
+        with self.__conn.cursor() as conn:
+            for start, end in pairwise([dt.datetime.min, *starts, dt.datetime.max]):
+                for result in self.__query(conn, typ, latest, [start, end]):
+                    try:
+                        self._validate(typ, result, ReferenceResolver(resolve=False))
+                    except ValidationError as e:
+                        raise IncompatibleSchemaError(
+                            f"{typ.__qualname__} cannot read its latest object written before {end}: {e}"
+                        ) from None
 
-                if parquet:
-                    # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own
-                    # time zone
-                    schema = self.__arrow.arrow_schema(self.record_type(typ))
-                    table = relation.to_arrow_table()
-                    records = (
-                        table.select(schema.names)
-                        .cast(schema)
-                        .to_pylist(maps_as_pydicts="strict")
-                    )
-                    filenames = table["filename"].to_pylist()
-                    record_type = pa.struct(schema)
-                    results[typ] = [
-                        _drop_absent(r, record_type, self.__file_type(f))
-                        for r, f in zip(records, filenames, strict=True)
-                    ]
-
-                    for f in set(filenames) - self.__checked_files:
-                        self.__checked_files.add(f)
-                        if ignored := self.__differences(typ, f)[1]:
-                            warnings.warn(
-                                f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
-                                stacklevel=2,
-                            )
-                else:
-                    results[typ] = [row for (row,) in relation.fetchall()]
-
-        return results
+        self.__fs.makedirs(directory, exist_ok=True)
+        self.__fs.write_bytes(f"{directory / filename}{_SCHEMA_SUFFIX}", dumps(schema))
 
     def _write(
         self,
@@ -306,25 +346,17 @@ class FSStore(PersistableStore):
     ):
         # Unique, as concurrent writers may share an entry time. Not ":", which some file systems disallow
         filename = f"{entry_time.isoformat().replace(':', '~')}-{uuid4().hex[:8]}"
-        parquet = self.record_format is RecordFormat.Parquet
 
-        if parquet:
-            # Before writing anything
-            for typ in by_type:
-                files = self.__fs.glob(f"{self.__directory(typ)}/**/*.parquet")
-                if problems := {
-                    p for f in files for p in self.__differences(typ, f)[0]
-                }:
-                    raise IncompatibleSchemaError(
-                        f"{typ.__qualname__}: {'; '.join(sorted(problems))}"
-                    )
+        for typ in by_type.keys() - self.__checked_types:  # Before writing anything
+            self.__check_schema(typ, filename)
+            self.__checked_types.add(typ)
 
         for typ, records in by_type.items():
             directory = self.__directory(typ)
             self.__fs.makedirs(directory, exist_ok=True)
             path = directory / filename
 
-            if parquet:
+            if self.record_format is RecordFormat.Parquet:
                 schema = self.__arrow.arrow_schema(self.record_type(typ))
                 table = pa.Table.from_pylist(
                     self.__arrow.arrow_value(records, pa.list_(pa.struct(schema))),

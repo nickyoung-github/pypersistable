@@ -1,6 +1,7 @@
 import datetime as dt
 from abc import ABC, abstractmethod
 from collections.abc import Coroutine
+from contextvars import ContextVar
 from dataclasses import InitVar, fields, make_dataclass
 from functools import cache
 from hashlib import sha512
@@ -24,7 +25,7 @@ from pydantic import (
     SerializerFunctionWrapHandler,
     TypeAdapter,
 )
-from pydantic_core import CoreSchema, core_schema
+from pydantic_core import CoreSchema, PydanticSerializationError, core_schema
 
 from .object_store import ObjectStore, ReadBatch, UnknownObjectError
 from .persistable_id import PersistableId
@@ -38,6 +39,14 @@ T = TypeVar("T")
 IdField = Annotated[T, _IdFieldIndicator]
 
 _ID_ONLY = "id_only"
+
+
+class _IdCycleError(ValueError):
+    """A reference cycle in id fields: an object's id would depend on itself"""
+
+
+# The objects whose ids are being computed, outermost first
+_COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", default=())
 
 
 class Persistable(ABC):
@@ -103,12 +112,30 @@ class Persistable(ABC):
 
     @property
     def object_id(self) -> PersistableId:
-        id_type = self.id_type()
-        return self._object_id(
-            self
-            if isinstance(self, id_type)
-            else {f.name: getattr(self, f.name) for f in fields(id_type)}
-        )
+        computing = _COMPUTING_IDS.get()
+        if (
+            start := next((i for i, o in enumerate(computing) if o is self), None)
+        ) is not None:
+            cycle = " -> ".join(
+                type(o).__qualname__ for o in (*computing[start:], self)
+            )
+            raise _IdCycleError(f"Reference cycle in id fields: {cycle}")
+
+        token = _COMPUTING_IDS.set((*computing, self))
+        try:
+            id_type = self.id_type()
+            return self._object_id(
+                self
+                if isinstance(self, id_type)
+                else {f.name: getattr(self, f.name) for f in fields(id_type)}
+            )
+        except PydanticSerializationError as e:
+            # Raised computing a nested object's id, within serialisation: re-raised as is, rather than wrapped
+            if isinstance(e.__cause__, _IdCycleError):
+                raise e.__cause__ from None
+            raise
+        finally:
+            _COMPUTING_IDS.reset(token)
 
     @overload
     @classmethod

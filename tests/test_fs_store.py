@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime as dt
 import os
@@ -32,6 +33,7 @@ from pypersistable import (
     IdField,
     IncompatibleSchemaError,
     RecordFormat,
+    TypeRegistry,
     UnknownObjectError,
     UnsupportedTypeError,
     WriteConflictError,
@@ -588,44 +590,30 @@ class Host(Identifiable):
 registry.register(Host.__name__, Host)
 
 
+# Schema evolution: each type is another version of the one before, as if its code had been changed
+
+
 @dataclass
 class Evolving(Identifiable):
     name: IdField[str]
     added: int = 7  # Added after the first version was written
 
 
-registry.register(Evolving.__name__, Evolving)
+@dataclass
+class EvolvingBefore(Identifiable):
+    name: IdField[str]
 
 
-def test_parquet_changed_field_type_raises(tmp_path):
-    url = f"file://{tmp_path}"
-    Evolving(name="a", added=1).write(FSStore(url))
-
-    # As if added were changed to a float
-    changed = persistable_arrow_converter()
-    changed.add_struct(
-        lambda t: {"name": IdField[str], "added": float} if t is Evolving else None
-    )
-    store = FSStore(url, arrow_converter=changed)
-    with pytest.raises(
-        IncompatibleSchemaError, match="data.added is double, but int64 when persisted"
-    ):
-        Evolving(name="b", added=2).write(store)
-    assert len([p for p in tmp_path.rglob("*") if p.is_file()]) == 1  # Nothing written
+@dataclass
+class EvolvingRetyped(Identifiable):
+    name: IdField[str]
+    added: str = "7"
 
 
-def test_parquet_removed_field_is_ignored(tmp_path):
-    url = f"file://{tmp_path}"
-    Evolving(name="a", added=1).write(FSStore(url))
-
-    # Evolving, a plain dataclass, ignores extra fields: added may be removed
-    removed = persistable_arrow_converter()
-    removed.add_struct(lambda t: {"name": IdField[str]} if t is Evolving else None)
-    store = FSStore(url, arrow_converter=removed)
-    Evolving(name="b").write(store)
-
-    with pytest.warns(UserWarning, match="ignoring data.added, removed from Evolving"):
-        assert Evolving.read(store, name="a") == Evolving(name="a")
+@dataclass
+class EvolvingNoDefault(Identifiable):
+    name: IdField[str]
+    added: int
 
 
 @dataclass
@@ -636,47 +624,141 @@ class StrictInner:
 
 
 @dataclass
+class StrictInnerRemoved:
+    __pydantic_config__ = ConfigDict(extra="forbid")
+    x: int
+
+
+@dataclass
 class HoldsStrict(Identifiable):
     name: IdField[str]
     inner: StrictInner
     inners: list[StrictInner]
 
 
-registry.register(HoldsStrict.__name__, HoldsStrict)
+@dataclass
+class HoldsStrictRemoved(Identifiable):
+    name: IdField[str]
+    inner: StrictInnerRemoved
+    inners: list[StrictInnerRemoved]
 
 
-def test_parquet_removed_field_raises_if_extra_forbidden(tmp_path):
-    url = f"file://{tmp_path}"
-    HoldsStrict(name="a", inner=StrictInner(1), inners=[StrictInner(2)]).write(
-        FSStore(url)
-    )
-
-    removed = persistable_arrow_converter()
-    removed.add_struct(lambda t: {"x": int} if t is StrictInner else None)
-    with pytest.raises(
-        IncompatibleSchemaError,
-        match="data.inner.y has been removed; data.inners.item.y has been removed",
-    ):
-        HoldsStrict(name="b", inner=StrictInner(1), inners=[]).write(
-            FSStore(url, arrow_converter=removed)
-        )
+for _typ in (
+    Evolving,
+    EvolvingBefore,
+    EvolvingRetyped,
+    EvolvingNoDefault,
+    HoldsStrict,
+    HoldsStrictRemoved,
+):
+    registry.register(_typ.__name__, _typ)
 
 
-def test_parquet_added_field_defaults(tmp_path):
-    url = f"file://{tmp_path}"
-    # Writes Evolving as it was before the added field
-    before = persistable_arrow_converter()
-    before.add_struct(lambda t: {"name": IdField[str]} if t is Evolving else None)
-    Evolving(name="old", added=1).write(FSStore(url, arrow_converter=before))
+@pytest.fixture
+def redefine(monkeypatch):
+    """Makes a type a redefinition of another: persisted as it, as if its code had been changed"""
 
-    store = FSStore(url)
+    def redefine(old: type, new: type):
+        for method in ("registered_name", "root"):
+            original = getattr(TypeRegistry, method)
+            monkeypatch.setattr(
+                TypeRegistry,
+                method,
+                lambda self, t, original=original: original(
+                    self, old if t is new else t
+                ),
+            )
+
+    return redefine
+
+
+def schema_files(tmp_path) -> list:
+    return sorted(tmp_path.rglob("*.jsonschema"))
+
+
+def test_added_field_defaults(store, redefine):
+    EvolvingBefore(name="old").write(store)
+    redefine(EvolvingBefore, Evolving)
     new = Evolving(name="new", added=2)
     new.write(store)
 
-    # One read of both files
     old_id = Evolving(name="old").object_id
-    read = store.read([old_id, new.object_id])
+    read = store.read([old_id, new.object_id])  # One read of both versions' files
     assert read == {old_id: Evolving(name="old"), new.object_id: new}
+
+
+def test_added_field_without_default_raises(store, redefine, tmp_path):
+    EvolvingBefore(name="old").write(store)
+    redefine(EvolvingBefore, EvolvingNoDefault)
+    with pytest.raises(IncompatibleSchemaError, match="EvolvingNoDefault cannot read"):
+        EvolvingNoDefault(name="new", added=1).write(store)
+    assert len(schema_files(tmp_path)) == 1  # Not recorded
+
+
+def test_changed_field_type_raises(store, redefine):
+    Evolving(name="old", added=1).write(store)
+    redefine(Evolving, EvolvingRetyped)
+    match = (
+        "data.added is string, but int64"
+        if store.record_format is RecordFormat.Parquet
+        else "cannot read"
+    )
+    with pytest.raises(IncompatibleSchemaError, match=match):
+        EvolvingRetyped(name="new").write(store)
+
+
+def test_unrecorded_schema_is_checked(store, redefine, tmp_path):
+    # E.g. objects written before schemas were recorded
+    Evolving(name="old", added=1).write(store)
+    schema_files(tmp_path)[0].unlink()
+
+    redefine(Evolving, EvolvingRetyped)
+    with pytest.raises(IncompatibleSchemaError):
+        EvolvingRetyped(name="new").write(store)
+
+
+def test_removed_field_is_ignored(store, redefine):
+    Evolving(name="old", added=1).write(store)
+    # EvolvingBefore, a plain dataclass, ignores extra fields: added may be removed
+    redefine(Evolving, EvolvingBefore)
+    # Warns (Parquet only) once per file, here when the schema check reads the old object
+    with (
+        pytest.warns(
+            UserWarning, match="ignoring data.added, removed from EvolvingBefore"
+        )
+        if store.record_format is RecordFormat.Parquet
+        else contextlib.nullcontext()
+    ):
+        EvolvingBefore(name="new").write(store)
+
+    assert EvolvingBefore.read(store, name="old") == EvolvingBefore(name="old")
+
+
+def test_removed_field_raises_if_extra_forbidden(store, redefine):
+    HoldsStrict(name="old", inner=StrictInner(1), inners=[StrictInner(2)]).write(store)
+    redefine(HoldsStrict, HoldsStrictRemoved)
+    match = (
+        "data.inner.y has been removed; data.inners.item.y has been removed"
+        if store.record_format is RecordFormat.Parquet
+        else "cannot read"
+    )
+    with pytest.raises(IncompatibleSchemaError, match=match):
+        HoldsStrictRemoved(name="new", inner=StrictInnerRemoved(1), inners=[]).write(
+            store
+        )
+
+
+def test_schema_recorded_on_change(store, redefine, tmp_path):
+    EvolvingBefore(name="a").write(store)
+    EvolvingBefore(name="b").write(store)
+    FSStore(f"file://{tmp_path}", record_format=store.record_format).write(
+        [EvolvingBefore(name="c")]
+    )
+    assert len(schema_files(tmp_path)) == 1
+
+    redefine(EvolvingBefore, Evolving)
+    Evolving(name="d").write(store)
+    assert len(schema_files(tmp_path)) == 2
 
 
 def test_parquet_custom_type(tmp_path):

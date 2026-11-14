@@ -232,12 +232,28 @@ methods to read the latest version as of those times:
 Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))  # As we knew it on 1 January
 ```
 
+### Schema evolution
+Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
+Changing a field's type is not supported, nor is removing (or renaming) a field of a type which forbids extra fields
+(pydantic's `extra="forbid"`): its persisted objects could no longer be read. Otherwise, a removed field's persisted
+data is ignored when read (for Parquet, with a warning, once per file).
+
+`FSStore` checks this on its first write of a type, if the type's JSON schema differs from the latest recorded for it
+(in a `.jsonschema` file, named like the data files, in the type's directory). It reads, with the type, the latest
+object written under each recorded schema (and any written before the first), and for Parquet compares the type's
+schema with that of each persisted file. It raises an `IncompatibleSchemaError` if any is incompatible, else records
+the new schema.
+
+As it reads one object per schema, it may miss incompatibilities in fields which happen to be empty (e.g. `None`) in
+that object. Validation of JSON is lax, so some type changes, e.g. from `int` to `float`, are compatible.
+
 ### JSON
 Records are written as a JSON array. `bytes` are base64-encoded.
 
 ### Parquet
->`persistable_arrow_converter` (in `pypersistable.arrow`) can be used standalone, it does not depend on `Persistable` behaviour
->and can be extended with user-defined custom behaviour
+>`ArrowConverter` (in `pypersistable.arrow`) can be used standalone: it does not depend on `Persistable` behaviour
+>and can be extended with user-defined custom behaviour. `persistable_arrow_converter()` returns one extended to handle
+>`Reference` and `DiscriminatedUnion` (see [Custom types](#custom-types))
 
 The Parquet schema is generated from the type hints, with:
 
@@ -254,12 +270,6 @@ The Parquet schema is generated from the type hints, with:
 
 Parquet has no union type: other than `T | None`, unions must be a `Reference` (of `Persistable`) or a
 `DiscriminatedUnion`. Unsupported types raise `UnsupportedTypeError`.
-
-Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
-Changing a field's type is not supported: writing raises an `IncompatibleSchemaError` if it differs from that in the
-type's persisted files. So is removing (or renaming) a field of a type which forbids extra fields (pydantic's
-`extra="forbid"`), as its persisted objects could no longer be validated. Otherwise, a removed field's persisted data
-is ignored when read, with a warning (once per file).
 
 #### Custom types
 - `add_type(typ, arrow_type, to_arrow=None)`: store `typ` (and its subclasses) as `arrow_type`, with `to_arrow`

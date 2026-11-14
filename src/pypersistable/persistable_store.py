@@ -11,6 +11,8 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from pydantic import ConfigDict, TypeAdapter
+from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
+from pydantic_core import CoreSchema
 
 from .discriminated_union import STRUCT_LAYOUT
 from .object_store import ObjectStore, WriteConflictError
@@ -44,6 +46,14 @@ def _user() -> str:
         return getpass.getuser()
     except OSError:  # E.g. in a container, running as a uid with no name
         return "unknown"
+
+
+class _LenientJsonSchema(GenerateJsonSchema):
+    def handle_invalid_for_json_schema(
+        self, schema: CoreSchema, error_info: str
+    ) -> JsonSchemaValue:
+        # A type with no JSON schema, e.g. an arbitrary class: noted, so that changing it changes the schema
+        return {"description": error_info}
 
 
 class PersistableStore(ObjectStore):
@@ -94,6 +104,26 @@ class PersistableStore(ObjectStore):
     def __record_adapter(cls, typ: type[Persistable]) -> TypeAdapter[ObjectRecord]:
         return TypeAdapter(cls.record_type(typ))
 
+    @classmethod
+    @cache
+    def _json_schema(cls, typ: type[Persistable]) -> dict[str, Any]:
+        """The JSON schema of typ's records"""
+        return cls.__record_adapter(typ).json_schema(
+            schema_generator=_LenientJsonSchema
+        )
+
+    def _validate(
+        self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
+    ) -> ObjectRecord:
+        """A result of _read, validated as a record of typ"""
+        adapter = self.__record_adapter(typ)
+        validate = (
+            adapter.validate_json
+            if self.__record_format is RecordFormat.Json
+            else adapter.validate_python
+        )
+        return validate(result, context={RESOLVER: resolver})
+
     def read(
         self,
         object_ids: Iterable[PersistableId],
@@ -114,22 +144,14 @@ class PersistableStore(ObjectStore):
             by_type.setdefault(object_id.typ, set()).add(object_id)
 
         ret: dict[PersistableId, Persistable] = {}
-        context = {RESOLVER: resolver}
         unresolved = []  # Records with references, to validate again once those are loaded
 
         for typ, results in self._read(by_type, effective_time, entry_time).items():
-            adapter = self.__record_adapter(typ)
-            validate = (
-                adapter.validate_json
-                if self.__record_format is RecordFormat.Json
-                else adapter.validate_python
-            )
-
             for result in results:
                 misses = resolver.misses
-                record = validate(result, context=context)  # pyright: ignore[reportArgumentType]
+                record = self._validate(typ, result, resolver)
                 if resolver.misses > misses:
-                    unresolved.append((validate, result))
+                    unresolved.append((typ, result))
                 else:
                     ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
 
@@ -142,8 +164,8 @@ class PersistableStore(ObjectStore):
                 raise RuntimeError(f"Failed to load references {missing!r}")
 
             resolver.resolved.update(loaded)
-            for validate, result in unresolved:
-                record = validate(result, context=context)
+            for typ, result in unresolved:
+                record = self._validate(typ, result, resolver)
                 ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
 
         return ret
