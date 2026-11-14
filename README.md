@@ -136,7 +136,8 @@ A nightly job to compact the timestamped files into a single file will improve r
 ```python
 from pypersistable import FSStore, RecordFormat
 
-store = FSStore("file:///users/hades/ObjectStore", record_format=RecordFormat.Parquet)  # Parquet is the default
+# Parquet is the default
+store = FSStore("file:///users/hades/ObjectStore", record_format=RecordFormat.Parquet)
 best_boy = Dog(name="Cerberus")
 best_boy.write(store)
 ```
@@ -234,7 +235,8 @@ as does writing an object which references it.
 best_boy.del_(store)
 Dog.read(store, name="Cerberus")  # Raises UnknownObjectError
 best_boy.write(store)  # Restored
-Dog.delete(store, name="Cerberus")  # Reads it, then deletes it: raises UnknownObjectError if not found
+# Reads it, then deletes it: raises UnknownObjectError if not found
+Dog.delete(store, name="Cerberus")
 ```
 
 Deleting is checked for conflicts as writing is, and objects not persisted, or already deleted, are ignored.
@@ -245,7 +247,8 @@ Each record has an `effective_time`, when it takes effect, and an `entry_time`, 
 methods to read the latest version as of those times:
 
 ```python
-Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))  # As we knew it on 1 January
+# As we knew it on 1 January
+Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))
 ```
 
 An object read as of an earlier `entry_time` is out of date if it has since been rewritten, so writing it back
@@ -352,5 +355,6 @@ hound.heads = "3"  # Raises pydantic.ValidationError: strict, so not coerced
 - `ClassVar` and `InitVar` fields, and fields whose class attribute is a data descriptor (e.g. a property), are not
   validated
 - Without slots, a field's class attribute is the validating descriptor, not its default, and the default of an
-  `init=False` field, never assigned, is not validated
+  `init=False` field, never assigned, is not validated. Nor, once deleted (`del obj.field`), does reading a field
+  fall back to its default or raise `AttributeError`: it reads as the descriptor, unless it is an `init=False` field
 - Combining with another metaclass (e.g. `ABCMeta`) requires one derived from both

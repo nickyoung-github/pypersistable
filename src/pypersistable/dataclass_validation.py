@@ -1,6 +1,6 @@
 from contextvars import ContextVar
 from dataclasses import MISSING, fields
-from functools import cache, cached_property, partial, wraps
+from functools import cached_property, partial, wraps
 from inspect import getattr_static, isdatadescriptor
 from types import MemberDescriptorType
 from typing import Any, get_type_hints
@@ -8,15 +8,12 @@ from typing import Any, get_type_hints
 from pydantic import GetCoreSchemaHandler, TypeAdapter, ValidatorFunctionWrapHandler
 from pydantic_core import CoreSchema, core_schema
 
+from .typed_cache import type_adapter
+
 _SCHEMA_HOOK = "__get_pydantic_core_schema__"
 
 # Set while pydantic constructs an instance, setting fields it has validated already
 _CONSTRUCTING: ContextVar[bool] = ContextVar("_CONSTRUCTING", default=False)
-
-
-@cache
-def type_adapter(typ: Any) -> TypeAdapter:
-    return TypeAdapter(typ)
 
 
 class _ValidatingFieldDescriptor:
@@ -36,11 +33,22 @@ class _ValidatingFieldDescriptor:
             return value
         return self._adapter.validate_python(value, strict=True)
 
+    def _no_attribute(self) -> AttributeError:
+        return AttributeError(
+            f"{self._owner.__qualname__!r} object has no attribute {self._name!r}"
+        )
+
 
 class _DictFieldDescriptor(_ValidatingFieldDescriptor):
     # No __get__, so reads find the value in the instance's __dict__ directly
     def __set__(self, obj: Any, value: Any):
         obj.__dict__[self._name] = self._validate(value)
+
+    def __delete__(self, obj: Any):
+        try:
+            del obj.__dict__[self._name]
+        except KeyError:
+            raise self._no_attribute() from None
 
 
 class _UninitialisedFieldDescriptor(_DictFieldDescriptor):
@@ -54,9 +62,7 @@ class _UninitialisedFieldDescriptor(_DictFieldDescriptor):
         if obj is not None and self._name in obj.__dict__:
             return obj.__dict__[self._name]
         if self.__default is MISSING:
-            raise AttributeError(
-                f"{self._owner.__qualname__!r} object has no attribute {self._name!r}"
-            )
+            raise self._no_attribute()
         return self.__default
 
 
@@ -70,6 +76,9 @@ class _SlotFieldDescriptor(_ValidatingFieldDescriptor):
 
     def __set__(self, obj: Any, value: Any):
         self.slot.__set__(obj, self._validate(value))
+
+    def __delete__(self, obj: Any):
+        self.slot.__delete__(obj)
 
 
 def _constructing(value: Any, handler: ValidatorFunctionWrapHandler) -> Any:

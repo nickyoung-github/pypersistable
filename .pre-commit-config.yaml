@@ -1,0 +1,17 @@
+repos:
+  # Keep rev in line with ruff's version in uv.lock, so that both apply the same rules
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  # The project's own pyright and environment, from uv.lock
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false

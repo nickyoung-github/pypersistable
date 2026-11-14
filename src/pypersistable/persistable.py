@@ -2,7 +2,6 @@ import datetime as dt
 from collections.abc import Coroutine
 from contextvars import ContextVar
 from dataclasses import InitVar, fields, make_dataclass
-from functools import cache
 from hashlib import sha512
 from typing import (
     Annotated,
@@ -22,13 +21,12 @@ from pydantic import (
     GetCoreSchemaHandler,
     SerializationInfo,
     SerializerFunctionWrapHandler,
-    TypeAdapter,
 )
 from pydantic_core import CoreSchema, PydanticSerializationError, core_schema
 
 from .object_store import ObjectStore, ReadBatch, UnknownObjectError
 from .persistable_id import PersistableId
-from .typed_cache import typed_cache
+from .typed_cache import type_adapter, typed_cache
 
 
 class _IdFieldIndicator: ...
@@ -89,14 +87,9 @@ class Persistable:
         raise NotImplementedError
 
     @classmethod
-    @cache
-    def __id_adapter(cls) -> TypeAdapter:
-        return TypeAdapter(cls.id_type())
-
-    @classmethod
     def _object_id(cls, source: Any) -> PersistableId:
         # source is either the id fields, as a dict, or an instance of id_type
-        adapter = cls.__id_adapter()
+        adapter = type_adapter(cls.id_type())
         id_value = adapter.validate_python(source)
         values = adapter.dump_python(
             id_value, mode="json", context={_ID_ONLY: id_value}

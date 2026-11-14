@@ -1,3 +1,4 @@
+import datetime as dt
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass
 
@@ -93,7 +94,7 @@ class Cat:
 @dataclass(frozen=True, kw_only=True)
 class Kennel(Identifiable):
     name: IdField[str]
-    pet: DiscriminatedUnion[Dog, Cat, int]  # pyright: ignore[reportInvalidTypeForm]
+    pet: DiscriminatedUnion[Dog, Cat, int]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -108,7 +109,7 @@ class Deal(Identifiable):
 class ModelDeal(Identifiable, BaseModel):
     deal_id: IdField[str]
     counterparty: Reference[Counterparty]
-    pet: DiscriminatedUnion[Dog, Cat]  # pyright: ignore[reportInvalidTypeForm]
+    pet: DiscriminatedUnion[Dog, Cat]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -171,7 +172,12 @@ class DictStore(ObjectStore):
         self.objects = {o.object_id: o for o in objects}
         self.reads = []
 
-    def read(self, object_ids: Iterable, *_times):
+    def read(
+        self,
+        object_ids: Iterable,
+        effective_time: dt.datetime = dt.datetime.max,
+        entry_time: dt.datetime = dt.datetime.max,
+    ):
         ids = list(object_ids)
         self.reads.append(ids)
         return {i: self.objects[i] for i in ids if i in self.objects}

@@ -27,9 +27,11 @@ from models import (
     TradingBook,
     registry,
 )
-from pydantic import ConfigDict, Field, NaiveDatetime
+from pydantic import ConfigDict, Field, NaiveDatetime, ValidationError
+from pydantic_core import core_schema
 
 from pypersistable import (
+    DiscriminatedUnion,
     FSStore,
     Identifiable,
     IdField,
@@ -297,7 +299,7 @@ def test_parquet_records_written_before_active(tmp_path):
     before = persistable_arrow_converter()
     before.add_struct(
         lambda t: (
-            {k: v for k, v in dataclass_fields(t).items() if k != "active"}
+            {k: v for k, v in (dataclass_fields(t) or {}).items() if k != "active"}
             if issubclass(t, ObjectRecord)
             else None
         )
@@ -345,9 +347,10 @@ def test_delete_out_of_date_raises(store):
 
 
 def test_reference_to_deleted_resolves(store):
-    head = Node(name="a", next=Node(name="b"))
+    tail = Node(name="b")
+    head = Node(name="a", next=tail)
     head.write(store)
-    head.next.del_(store)
+    tail.del_(store)
 
     with pytest.raises(UnknownObjectError):
         Node.read(store, name="b")
@@ -355,14 +358,15 @@ def test_reference_to_deleted_resolves(store):
 
 
 def test_write_restores_deleted_reference(store, spy):
-    head = Node(name="a", next=Node(name="b"))
+    tail = Node(name="b")
+    head = Node(name="a", next=tail)
     head.write(store)
-    head.next.del_(store)
+    tail.del_(store)
 
     # Unchanged itself, but writes the deleted object it references, restoring it
     head.write(store)
     assert spy["writes"][-1] == {"Node": 1}
-    assert Node.read(store, name="b") == head.next
+    assert Node.read(store, name="b") == tail
 
 
 def test_require_load_of_existing_delete(strict_store):
@@ -412,6 +416,7 @@ def test_stale_reference_raises(store):
     theirs.next = Node(name="c")
     theirs.write(store)
 
+    assert mine.next is not None
     mine.next.next = Node(name="d")
     with pytest.raises(WriteConflictError, match="Node/.* was written at"):
         mine.write(store)
@@ -767,6 +772,66 @@ class HoldsStrictRemoved(Identifiable):
     inners: list[StrictInnerRemoved]
 
 
+@dataclass
+class Part:
+    x: int
+
+
+@dataclass
+class PartAdded:
+    x: int
+    y: int = 0
+
+
+@dataclass
+class HoldsParts(Identifiable):
+    name: IdField[str]
+    by_key: dict[str, Part]
+    parts: list[Part]
+    maybe: Part | None = None
+
+
+@dataclass
+class HoldsPartsAdded(Identifiable):
+    name: IdField[str]
+    by_key: dict[str, PartAdded]
+    parts: list[PartAdded]
+    maybe: PartAdded | None = None
+
+
+@dataclass
+class Pet:
+    x: int
+    y: int = 0
+
+
+@dataclass
+class PetRemoved:
+    x: int
+
+
+# A redefinition of Pet, without y: its tag in a DiscriminatedUnion is the same
+PetRemoved.__qualname__ = "Pet"
+
+
+@dataclass
+class HoldsPet(Identifiable):
+    name: IdField[str]
+    pet: DiscriminatedUnion[Pet, int]
+
+
+@dataclass
+class HoldsPetRemoved(Identifiable):
+    name: IdField[str]
+    pet: DiscriminatedUnion[PetRemoved, int]
+
+
+@dataclass
+class HoldsPetFewer(Identifiable):
+    name: IdField[str]
+    pet: DiscriminatedUnion[Pet, str]
+
+
 for _typ in (
     Evolving,
     EvolvingBefore,
@@ -774,6 +839,11 @@ for _typ in (
     EvolvingNoDefault,
     HoldsStrict,
     HoldsStrictRemoved,
+    HoldsParts,
+    HoldsPartsAdded,
+    HoldsPet,
+    HoldsPetRemoved,
+    HoldsPetFewer,
 ):
     registry.register(_typ.__name__, _typ)
 
@@ -831,6 +901,21 @@ def test_changed_field_type_raises(store, redefine, name):
     )
     with pytest.raises(IncompatibleSchemaError, match=match):
         EvolvingRetyped(name=name).write(store)
+
+
+def test_changed_field_type_raises_reading(store, redefine):
+    # Read before any write, which would check the schema
+    Evolving(name="old", added=1).write(store)
+    redefine(Evolving, EvolvingRetyped)
+    parquet = store.record_format is RecordFormat.Parquet
+    with pytest.raises(
+        IncompatibleSchemaError if parquet else ValidationError,
+        match="data.added is string, but int64" if parquet else "added",
+    ):
+        EvolvingRetyped.read(store, name="old")
+    # Again, not having been marked checked
+    with pytest.raises(IncompatibleSchemaError if parquet else ValidationError):
+        EvolvingRetyped.read(store, name="old")
 
 
 def define_redefined(value_type: type) -> type:
@@ -897,6 +982,102 @@ def test_removed_field_raises_if_extra_forbidden(store, redefine):
         HoldsStrictRemoved(name="new", inner=StrictInnerRemoved(1), inners=[]).write(
             store
         )
+
+
+def parquet_warns(store, match: str):
+    # Ignored fields are warned of reading Parquet only
+    return (
+        pytest.warns(UserWarning, match=match)
+        if store.record_format is RecordFormat.Parquet
+        else contextlib.nullcontext()
+    )
+
+
+def test_field_added_in_collections_defaults(store, redefine):
+    HoldsParts(name="old", by_key={"a": Part(1)}, parts=[Part(2)], maybe=Part(3)).write(
+        store
+    )
+    redefine(HoldsParts, HoldsPartsAdded)
+    HoldsPartsAdded(name="new", by_key={}, parts=[]).write(store)
+
+    assert HoldsPartsAdded.read(store, name="old") == HoldsPartsAdded(
+        name="old", by_key={"a": PartAdded(1)}, parts=[PartAdded(2)], maybe=PartAdded(3)
+    )
+
+
+def test_field_removed_in_collections_is_ignored(store, redefine):
+    HoldsPartsAdded(
+        name="old",
+        by_key={"a": PartAdded(1, 1)},
+        parts=[PartAdded(2, 2)],
+        maybe=PartAdded(3, 3),
+    ).write(store)
+    redefine(HoldsPartsAdded, HoldsParts)
+    with parquet_warns(
+        store, "ignoring data.by_key.value.y, data.parts.item.y, data.maybe.y"
+    ):
+        HoldsParts(name="new", by_key={}, parts=[]).write(store)
+
+    assert HoldsParts.read(store, name="old") == HoldsParts(
+        name="old", by_key={"a": Part(1)}, parts=[Part(2)], maybe=Part(3)
+    )
+
+
+def test_field_removed_in_union_member_is_ignored(store, redefine):
+    HoldsPet(name="old", pet=Pet(1, 2)).write(store)
+    redefine(HoldsPet, HoldsPetRemoved)
+    with parquet_warns(store, "ignoring data.pet.*Pet.y"):
+        HoldsPetRemoved(name="new", pet=1).write(store)
+
+    assert HoldsPetRemoved.read(store, name="old") == HoldsPetRemoved(
+        name="old", pet=PetRemoved(1)
+    )
+
+
+def test_removed_union_member_raises(store, redefine):
+    HoldsPet(name="old", pet=1).write(store)
+    redefine(HoldsPet, HoldsPetFewer)
+    match = (
+        "data.pet.builtins:int has been removed"
+        if store.record_format is RecordFormat.Parquet
+        else "cannot read"
+    )
+    with pytest.raises(IncompatibleSchemaError, match=match):
+        HoldsPetFewer(name="new", pet="a").write(store)
+
+
+class Opaque:
+    """Validated by a plain function: it has no JSON schema"""
+
+    def __init__(self, value: str):
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Opaque) and other.value == self.value
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler) -> core_schema.CoreSchema:
+        return core_schema.no_info_plain_validator_function(
+            lambda v: v if isinstance(v, Opaque) else Opaque(v),
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                lambda v: v.value
+            ),
+        )
+
+
+@dataclass
+class HoldsOpaque(Identifiable):
+    name: IdField[str]
+    opaque: Opaque
+
+
+registry.register("HoldsOpaque", HoldsOpaque)
+
+
+def test_type_without_json_schema(json_store):
+    holder = HoldsOpaque(name="h", opaque=Opaque("a"))
+    holder.write(json_store)
+    assert HoldsOpaque.read(json_store, name="h") == holder
 
 
 def test_schema_recorded_on_change(store, redefine, tmp_path):

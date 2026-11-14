@@ -7,7 +7,8 @@ from annotated_types import Gt
 from pydantic import AfterValidator, TypeAdapter, ValidationError, ValidationInfo
 from pydantic_core import core_schema
 
-from pypersistable.dataclass_validation import ValidatingDataclassMeta, type_adapter
+from pypersistable.dataclass_validation import ValidatingDataclassMeta
+from pypersistable.typed_cache import type_adapter
 
 
 @dataclass
@@ -139,6 +140,36 @@ def test_init_false(slots):
     assert (obj.no_default, obj.default) == (2, 2)
     with pytest.raises(ValidationError):
         obj.default = "a"  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.parametrize("cls", (Plain, Slotted))
+def test_delete(cls):
+    obj = cls(i=1)
+    del obj.i
+    if cls is Slotted:
+        with pytest.raises(AttributeError):
+            _ = obj.i
+    else:
+        assert "i" not in vars(obj)
+    with pytest.raises(AttributeError):
+        del obj.i
+
+    obj.i = 2
+    assert obj.i == 2
+    with pytest.raises(ValidationError):
+        obj.i = "2"
+
+
+def test_delete_init_false():
+    @dataclass
+    class Uninitialised(metaclass=ValidatingDataclassMeta):
+        default: int = field(init=False, default=1)
+
+    obj = Uninitialised()
+    obj.default = 2
+    del obj.default
+    # As for a dataclass, falls back to the default
+    assert obj.default == 1
 
 
 def test_validates_before_instantiation():

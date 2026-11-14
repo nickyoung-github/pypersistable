@@ -10,7 +10,7 @@ from functools import cache
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
-from pydantic import ConfigDict, TypeAdapter
+from pydantic import ConfigDict
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import CoreSchema
 
@@ -19,6 +19,7 @@ from .object_store import ObjectStore, WriteConflictError
 from .persistable import Persistable
 from .persistable_id import PersistableId
 from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolver
+from .typed_cache import type_adapter
 
 
 @dataclass
@@ -107,14 +108,9 @@ class PersistableStore(ObjectStore):
 
     @classmethod
     @cache
-    def __record_adapter(cls, typ: type[Persistable]) -> TypeAdapter[ObjectRecord]:
-        return TypeAdapter(cls.record_type(typ))
-
-    @classmethod
-    @cache
     def _json_schema(cls, typ: type[Persistable]) -> dict[str, Any]:
         """The JSON schema of typ's records"""
-        return cls.__record_adapter(typ).json_schema(
+        return type_adapter(cls.record_type(typ)).json_schema(
             schema_generator=_LenientJsonSchema
         )
 
@@ -122,7 +118,7 @@ class PersistableStore(ObjectStore):
         self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
     ) -> ObjectRecord:
         """A result of _read, validated as a record of typ"""
-        adapter = self.__record_adapter(typ)
+        adapter = type_adapter(self.record_type(typ))
         validate = (
             adapter.validate_json
             if self.__record_format is RecordFormat.Json
@@ -229,7 +225,7 @@ class PersistableStore(ObjectStore):
             active=active,
         )
         parquet = self.__record_format is RecordFormat.Parquet
-        return self.__record_adapter(type(obj)).dump_python(
+        return type_adapter(self.record_type(type(obj))).dump_python(
             record, mode="python" if parquet else "json", context=context
         )
 

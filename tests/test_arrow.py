@@ -2,7 +2,7 @@ import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal
 from ipaddress import IPv4Address
-from typing import Annotated, Any, Literal, NamedTuple
+from typing import Annotated, Any, Literal, NamedTuple, TypeVar
 
 import pyarrow as pa
 import pytest
@@ -118,9 +118,15 @@ def test_add_handler():
 
 @pytest.mark.parametrize(
     "hint",
-    [int | str, Literal["a", 1], tuple[int, str], dict, Any, Point],
+    # Any is a class: TypeVar is not
+    [int | str, Literal["a", 1], tuple[int, str], dict, Any, Point, TypeVar("T")],
     ids=str,
 )
 def test_unsupported_types_raise(hint):
     with pytest.raises(UnsupportedTypeError):
         ArrowConverter().arrow_type(hint)
+
+
+def test_arrow_schema_of_non_struct_raises():
+    with pytest.raises(UnsupportedTypeError, match="Not a struct-like type"):
+        ArrowConverter().arrow_schema(int)

@@ -29,6 +29,9 @@ from pypersistable import (
     Unique,
     UnknownObjectError,
 )
+from pypersistable.object_store import ReadBatch
+from pypersistable.persistable import Persistable
+from pypersistable.persistable_store import PersistableStore
 
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
@@ -252,3 +255,44 @@ def test_async_reads_are_batched_into_one_store_read():
     assert asyncio.run(read_both()) == [counterparty, book]
     assert len(store.reads) == 1
     assert set(store.reads[0]) == {counterparty.object_id, book.object_id}
+
+
+def test_async_read_unknown_object_raises():
+    async def read():
+        return await Counterparty.read(DictStore(), is_async=True, name="Nobody")
+
+    with pytest.raises(UnknownObjectError, match=r"Counterparty\(name='Nobody'\)"):
+        asyncio.run(read())
+
+
+def test_enqueue_after_dispatch_raises():
+    batch = ReadBatch()
+    batch.dispatch()
+    with pytest.raises(RuntimeError, match="after dispatch"):
+        _ = batch.enqueue(
+            DictStore(), Counterparty, Counterparty(name="Acme").object_id, {}
+        )
+
+
+def test_read_all_with_loop():
+    counterparty = Counterparty(name="Acme")
+    store = DictStore(counterparty)
+    loop = asyncio.new_event_loop()
+    try:
+        reads = PersistableStore.read_all(
+            Counterparty.read(store, is_async=True, name="Acme"), loop=loop
+        )
+    finally:
+        loop.close()
+    assert reads == [counterparty]
+
+
+def test_model_hash_is_object_ids():
+    # A pydantic model's, as a dataclass's __hash__ is replaced by @dataclass
+    counterparty = ModelCounterparty(name="Acme")
+    assert hash(counterparty) == hash(counterparty.object_id)
+
+
+def test_persistable_id_type_not_implemented():
+    with pytest.raises(NotImplementedError):
+        Persistable.id_type()
