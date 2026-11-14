@@ -3,14 +3,13 @@ import datetime as dt
 from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, ClassVar, Self, TypeVar
+from typing import Any, ClassVar, Self
 
-T = TypeVar("T")
+from .persistable_id import PersistableId
 
 
 class UnknownObjectError(KeyError):
-    def __init__(self, typ: type, kwargs: dict[str, Any], object_id: Path):
+    def __init__(self, typ: type, kwargs: dict[str, Any], object_id: PersistableId):
         self.typ = typ
         self.kwargs = kwargs
         self.object_id = object_id
@@ -24,10 +23,10 @@ class UnknownObjectError(KeyError):
 class ObjectStore:
     def read(
         self,
-        object_ids: Iterable[Path],
+        object_ids: Iterable[PersistableId],
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
-    ) -> dict[Path, Any]: ...
+    ) -> dict[PersistableId, Any]: ...
 
     def write(
         self,
@@ -51,8 +50,8 @@ class ReadBatch:
     )
 
     def __init__(self):
-        self.__pending: dict[_ReadKey, tuple[ObjectStore, set[Path]]] = {}
-        self.__tasks: dict[_ReadKey, asyncio.Future[dict[Path, Any]]] | None = None
+        self.__pending: dict[_ReadKey, tuple[ObjectStore, set[PersistableId]]] = {}
+        self.__tasks: dict[_ReadKey, asyncio.Future[dict[PersistableId, Any]]] | None = None
 
     @classmethod
     def current(cls) -> Self:
@@ -81,7 +80,7 @@ class ReadBatch:
         self,
         db: ObjectStore,
         typ: type,
-        object_id: Path,
+        object_id: PersistableId,
         kwargs: dict[str, Any],
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
@@ -94,7 +93,7 @@ class ReadBatch:
         return self.__result(key, typ, object_id, dict(kwargs))
 
     async def __result(
-        self, key: _ReadKey, typ: type, object_id: Path, kwargs: dict[str, Any]
+        self, key: _ReadKey, typ: type, object_id: PersistableId, kwargs: dict[str, Any]
     ) -> Any:
         self.dispatch()
         assert self.__tasks is not None

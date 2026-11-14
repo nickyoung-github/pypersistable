@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
 from pydantic import GetCoreSchemaHandler
@@ -11,6 +10,7 @@ from pydantic_core.core_schema import (
 )
 
 from .persistable import Persistable
+from .persistable_id import PersistableId
 from .persistable_store import ReferenceResolver
 
 
@@ -37,15 +37,16 @@ class _Reference:
                 raise TypeError(
                     f"Expected an object id or {source_type!s}, got {type(value)!s}"
                 )
-            return resolver(info).get(Path(value))
+            return resolver(info).get(PersistableId.parse(value))
 
-        def serialise(value: Persistable, _serialiser, info: SerializationInfo) -> Any:
+        def serialise(value: Persistable, serialiser, info: SerializationInfo) -> Any:
             try:
                 # Tell the resolver to persist the actual value
                 resolver(info).write(value)
                 return str(value.object_id)
             except RuntimeError:
-                return value
+                # No resolver: serialise by value, via the schema so that any context still applies
+                return serialiser(value)
 
         return with_info_before_validator_function(
             validate,
@@ -58,4 +59,4 @@ class _Reference:
 
 __REFERENCE = _Reference()
 T = TypeVar("T", bound=Persistable)
-Reference = Annotated[T | Path, __REFERENCE]
+Reference = Annotated[T | PersistableId, __REFERENCE]

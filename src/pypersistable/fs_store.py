@@ -12,9 +12,8 @@ from fsspec import url_to_fs
 from orjson import dumps
 
 from ._anyschema import PIPELINE
-from .persistable import Persistable
+from .persistable_id import PersistableId
 from .persistable_store import ObjectRecord, PersistableStore
-from .type_registry import TypeRegistry
 
 
 class FSStoreFormat(Enum):
@@ -27,7 +26,6 @@ class FSStore(PersistableStore):
         self.__fs, root = url_to_fs(url)
         self.__root = Path(root)
         self.__record_format = record_format
-        self.__type_registry = TypeRegistry[Persistable]()
         self.__conn = duckdb.connect()
         self.__conn.register_filesystem(self.__fs)
 
@@ -39,7 +37,7 @@ class FSStore(PersistableStore):
 
     def _read(
         self,
-        by_directory: dict[Path, list[Path]],
+        by_directory: dict[Path, list[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
     ) -> dict[Path, list[dict[str, Any]]]:
@@ -83,9 +81,7 @@ class FSStore(PersistableStore):
                 continue
 
             path = self.__root.joinpath(path)
-            typ = self.__type_registry.get_type(
-                Path(records[0]["object_id"]).parent.name
-            )
+            typ = PersistableId.parse(records[0]["object_id"]).typ
 
             self.__fs.makedirs(path.parent, exist_ok=True)
 

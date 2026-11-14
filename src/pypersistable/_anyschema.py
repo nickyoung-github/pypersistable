@@ -1,4 +1,3 @@
-from pathlib import Path
 from types import NoneType
 
 from anyschema.exceptions import UnsupportedDTypeError
@@ -14,10 +13,11 @@ from anyschema.parsers.pydantic import PydanticTypeStep
 from anyschema.typing import FieldType
 
 from .persistable import Persistable
+from .persistable_id import PersistableId
 
 
 class _UnionTypeStep(UnionTypeStep):
-    # References show up as a tuple of the underlying type and a Path. This is a hack to handle that.
+    # References show up as a tuple of the underlying type and PersistableId. This is a hack to handle that.
     # Replacees the anyschema default UnionTypeStep.
 
     def _parse_union(self, union: tuple[FieldType, ...]) -> FieldType:
@@ -34,7 +34,7 @@ class _UnionTypeStep(UnionTypeStep):
         if field0 is not NoneType and field1 is not NoneType:
             for f in (field0, field1):
                 if (
-                    f is not Path
+                    f is not PersistableId
                     and isinstance(f, type)
                     and not issubclass(f, Persistable)
                 ):

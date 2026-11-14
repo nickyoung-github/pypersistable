@@ -4,32 +4,31 @@ from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, make_dataclass
 from functools import cache
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import TypeAdapter
 
 from .object_store import ObjectStore
 from .persistable import Persistable
+from .persistable_id import PersistableId
 from .type_registry import TypeRegistry
-
-T = TypeVar("T", bound=type[Persistable])
 
 
 class ReferenceResolver:
     def __init__(self, store: ObjectStore):
         self.__store = store
         self.__discovering = True
-        self.__pending_reads: set[Path] = set()
-        self.__pending_writes: dict[Path, Persistable] = {}
-        self.__resolved: dict[Path, Persistable] = {}
+        self.__pending_reads: set[PersistableId] = set()
+        self.__pending_writes: dict[PersistableId, Persistable] = {}
+        self.__resolved: dict[PersistableId, Persistable] = {}
 
-    def get(self, object_id: Path):
+    def get(self, object_id: PersistableId):
         if object_id in self.__resolved:
             return self.__resolved[object_id]
         elif self.__discovering:
             self.__pending_reads.add(object_id)
             return str(object_id)
-        raise RuntimeError("Failed to resolve {object_id")
+        raise RuntimeError(f"Failed to resolve {object_id}")
 
     def write(self, obj: Persistable):
         self.__pending_writes[obj.object_id] = obj
@@ -70,15 +69,11 @@ class ObjectRecord[T]:  # There is a reason for this
     metadata: MetaData
     data: T
 
-    @property
-    def registered_name(self) -> str:
-        return str(Path(self.object_id).parent)
-
 
 class PersistableStore(ObjectStore):
     def _read(
         self,
-        by_directory: dict[Path, list[Path]],
+        by_directory: dict[Path, list[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
     ) -> dict[Path, list[dict[str, Any]]]: ...
@@ -108,25 +103,23 @@ class PersistableStore(ObjectStore):
 
     def read(
         self,
-        object_ids: Iterable[Path],
+        object_ids: Iterable[PersistableId],
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
-    ) -> dict[Path, Persistable]:
+    ) -> dict[PersistableId, Persistable]:
         # Group the reads by directory, handle deserialisation, and resolve references
 
-        ret: dict[Path, Persistable] = {}
-        by_directory: dict[Path, list[Path]] = {}
-        resolver_cache: dict[Path, Persistable] = {}
+        ret: dict[PersistableId, Persistable] = {}
+        by_directory: dict[Path, list[PersistableId]] = {}
+        resolver_cache: dict[PersistableId, Persistable] = {}
         type_registry = self.type_registry()
 
         for oid in object_ids:
-            # oid.parent is the registered_name
             if oid in resolver_cache:
                 ret[oid] = resolver_cache[oid]
                 continue
 
-            typ = type_registry.get_type(str(oid.parent))
-            directory = type_registry.root(typ).joinpath(oid.parent)
+            directory = type_registry.root(oid.typ).joinpath(oid.registered_name)
             by_directory.setdefault(directory, []).append(oid)
 
         all_results = self._read(by_directory, effective_time, entry_time)
@@ -134,7 +127,7 @@ class PersistableStore(ObjectStore):
             if not results:
                 continue
 
-            typ = type_registry.get_type(Path(results[0]["object_id"]).parent.name)
+            typ = PersistableId.parse(results[0]["object_id"]).typ
             type_adaptor = self.type_adaptor(self.record_type(typ))
 
             for result in results:
@@ -145,7 +138,7 @@ class PersistableStore(ObjectStore):
                 if resolver.resolve():
                     record = type_adaptor.validate_python(result, context=context)
 
-                object_id = Path(record.object_id)
+                object_id = PersistableId.parse(record.object_id)
                 resolver_cache[object_id] = ret[object_id] = record.data
 
         return ret
@@ -185,7 +178,7 @@ class PersistableStore(ObjectStore):
             obj = objects.pop()
             object_id = obj.object_id
             typ = type(obj)
-            directory = type_registry.root(typ).joinpath(object_id.parent)
+            directory = type_registry.root(typ).joinpath(object_id.registered_name)
             path = directory.joinpath(filename)
             record_type = self.record_type(typ)
             type_adapter = self.type_adaptor(record_type)

@@ -1,5 +1,4 @@
-import asyncio  # noqa: N999
-from dataclasses import dataclass
+from dataclasses import dataclass  # noqa: N999
 
 from pypersistable import (
     FSStore,
@@ -51,7 +50,7 @@ for store_format in (FSStoreFormat.Json, FSStoreFormat.Parquet):
         f"({store_format!s})Loaded counterparty matches original: {ctpy_loaded == ctpy}\n"
     )
 
-    book_id = CustomerBook.make_object_id(counterparty=ctpy_loaded)
+    book_id = book.object_id
     book_loaded = store.read([book_id])[book_id]
     print(f"({store_format!s})Loaded customer book: {book_loaded}")
     print(

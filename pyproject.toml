@@ -45,3 +45,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
 version_file = "persistable/_version.py"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.5",
+]
