@@ -36,14 +36,14 @@ test = [
 ]
 
 [project.urls]
-homepage = "https://github.com/nickyoung-github/persistable"
+homepage = "https://github.com/nickyoung-github/pypersistable"
 
 [build-system]
 requires = ["setuptools>=64", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
-version_file = "persistable/_version.py"
+version_file = "src/pypersistable/_version.py"
 
 [dependency-groups]
 dev = [

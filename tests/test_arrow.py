@@ -1,3 +1,4 @@
+import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal
 from ipaddress import IPv4Address
@@ -5,7 +6,7 @@ from typing import Annotated, Any, Literal, NamedTuple
 
 import pyarrow as pa
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, NaiveDatetime
 
 from pypersistable import ArrowConverter, UnsupportedTypeError
 
@@ -58,8 +59,23 @@ def test_add_type():
     converter.add_type(IPv4Address, pa.string(), str)
     assert converter.arrow_type(list[IPv4Address]) == pa.list_(pa.string())
 
-    rows = converter.arrow_value([{"a": [IPv4Address("10.0.0.1")]}])
+    row_type = pa.struct([("a", converter.arrow_type(list[IPv4Address]))])
+    rows = converter.arrow_value([{"a": [IPv4Address("10.0.0.1")]}], pa.list_(row_type))
     assert pa.Table.from_pylist(rows).to_pylist() == [{"a": ["10.0.0.1"]}]
+
+
+def test_naive_datetime_for_aware_timestamp_raises():
+    converter = ArrowConverter()
+    aware = dt.datetime(2026, 1, 2, tzinfo=dt.UTC)
+    assert converter.arrow_value(aware, converter.arrow_type(dt.datetime)) == aware
+    assert converter.arrow_value(
+        aware.replace(tzinfo=None), converter.arrow_type(NaiveDatetime)
+    )
+
+    with pytest.raises(ValueError, match="use NaiveDatetime"):
+        converter.arrow_value(
+            aware.replace(tzinfo=None), converter.arrow_type(dt.datetime)
+        )
 
 
 def test_add_type_overrides_builtin():

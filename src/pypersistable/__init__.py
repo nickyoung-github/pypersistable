@@ -1,6 +1,7 @@
 from .arrow import ArrowConverter, UnsupportedTypeError
 from .discriminated_union import DiscriminatedUnion
 from .fs_store import FSStore, persistable_arrow_converter
+from .object_store import UnknownObjectError, WriteConflictError
 from .persistable import Identifiable, IdField, Unique
 from .persistable_id import PersistableId
 from .persistable_store import ObjectStore, RecordFormat
@@ -20,7 +21,9 @@ __all__ = (
     "RegistrationError",
     "TypeRegistry",
     "Unique",
+    "UnknownObjectError",
     "UnregisteredTypeError",
     "UnsupportedTypeError",
+    "WriteConflictError",
     "persistable_arrow_converter",
 )

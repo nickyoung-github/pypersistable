@@ -19,6 +19,7 @@ from models import (
     Dog,
     Kennel,
     ModelDeal,
+    Node,
     PlainUnion,
     TradingBook,
     registry,
@@ -30,10 +31,11 @@ from pypersistable import (
     Identifiable,
     IdField,
     RecordFormat,
+    UnknownObjectError,
     UnsupportedTypeError,
+    WriteConflictError,
     persistable_arrow_converter,
 )
-from pypersistable.object_store import UnknownObjectError
 
 
 @pytest.fixture(params=list(RecordFormat), ids=lambda f: f.name)
@@ -194,19 +196,105 @@ def test_unchanged_objects_and_references_are_not_rewritten(store, spy):
     assert len(spy["writes"]) == 1
 
 
-def test_changed_reference_is_rewritten(store, spy):
-    store.write(shared_deals(1))
-    deal = Deal(
-        deal_id="D0",
-        counterparty=Counterparty(name="Acme", location="SW1"),
-        book=TradingBook(name="Book"),
-        others=(Counterparty(name="Acme", location="SW1"),),
+def moved_acme_deal() -> Deal:
+    moved = Counterparty(name="Acme", location="SW1")
+    return Deal(
+        deal_id="D0", counterparty=moved, book=TradingBook(name="Book"), others=(moved,)
     )
+
+
+def test_changed_reference_is_written(store, spy):
+    store.write(shared_deals(1))
+    deal = moved_acme_deal()
     store.write([deal])
 
     # Only the counterparty: the deal's record, referencing it by id, is unchanged
     assert spy["writes"][-1] == {"Counterparty": 1}
     assert Deal.read(store, deal_id="D0") == deal
+
+
+@pytest.fixture
+def strict_store(tmp_path, store) -> FSStore:
+    return FSStore(
+        f"file://{tmp_path}",
+        record_format=store.record_format,
+        require_load_of_existing=True,
+    )
+
+
+def test_require_load_of_existing(strict_store):
+    strict_store.write(shared_deals(1))
+    with pytest.raises(WriteConflictError, match="Counterparty/.* was not read"):
+        strict_store.write([moved_acme_deal()])
+
+    # New, unchanged or read objects may be written
+    Node(name="a").write(strict_store)
+    Node(name="a").write(strict_store)
+    read = Node.read(strict_store, name="a")
+    read.next = Node(name="b")
+    read.write(strict_store)
+    assert Node.read(strict_store, name="a") == read
+
+
+def test_force_overwrite_unread(strict_store):
+    strict_store.write(shared_deals(1))
+    deal = moved_acme_deal()
+    with pytest.warns(UserWarning, match="Overwriting: Counterparty/.* was not read"):
+        strict_store.write([deal], force_overwrite=True)
+    assert Deal.read(strict_store, deal_id="D0") == deal
+
+
+def test_force_overwrite_out_of_date(store):
+    Node(name="a").write(store)
+    mine, theirs = Node.read(store, name="a"), Node.read(store, name="a")
+    theirs.next = Node(name="b")
+    theirs.write(store)
+
+    mine.next = Node(name="c")
+    with pytest.warns(UserWarning, match="Overwriting: Node/.* was written at"):
+        mine.write(store, force_overwrite=True)
+    assert Node.read(store, name="a") == mine
+
+
+def test_object_entry_time(store):
+    node = Node(name="a")
+    assert node.object_entry_time is None
+
+    node.write(store)
+    written = node.object_entry_time
+    assert written is not None
+    assert Node.read(store, name="a").object_entry_time == written
+
+    node.write(store)  # Unchanged: not written again
+    assert node.object_entry_time == written
+
+
+def test_stale_write_raises(store):
+    Node(name="a").write(store)
+    mine, theirs = Node.read(store, name="a"), Node.read(store, name="a")
+
+    theirs.next = Node(name="b")
+    theirs.write(store)
+    theirs.next = Node(name="c")
+    theirs.write(store)  # Its own version is the latest
+
+    mine.next = Node(name="d")
+    with pytest.raises(WriteConflictError, match="was written at"):
+        mine.write(store)
+
+
+def test_stale_reference_raises(store):
+    head = Node(name="a", next=Node(name="b"))
+    head.write(store)
+    mine = Node.read(store, name="a")
+
+    theirs = Node.read(store, name="b")
+    theirs.next = Node(name="c")
+    theirs.write(store)
+
+    mine.next.next = Node(name="d")
+    with pytest.raises(WriteConflictError, match="Node/.* was written at"):
+        mine.write(store)
 
 
 def test_changed_object_is_rewritten(store, spy):
@@ -216,15 +304,10 @@ def test_changed_object_is_rewritten(store, spy):
     assert spy["writes"][-1] == {"Deal": 1, "Counterparty": 1}
 
 
-def test_check_false_writes_everything_once(store, spy):
-    store.write(shared_deals())
-    store.write(shared_deals(), check=False)
-    assert spy["writes"][-1] == {"Deal": 3, "Counterparty": 1, "TradingBook": 1}
-
-
 def test_references_resolved_in_one_read_per_level(store, spy):
     deals = shared_deals(10)
-    store.write(deals, check=False)
+    store.write(deals)
+    spy["reads"].clear()
 
     assert store.read([d.object_id for d in deals]) == {d.object_id: d for d in deals}
     assert spy["reads"] == [{"Deal": 10}, {"Counterparty": 1, "TradingBook": 1}]
@@ -232,7 +315,8 @@ def test_references_resolved_in_one_read_per_level(store, spy):
 
 def test_references_loaded_in_the_same_read_are_not_read_again(store, spy):
     deal = shared_deals(1)[0]
-    store.write([deal], check=False)
+    store.write([deal])
+    spy["reads"].clear()
 
     store.read([deal.object_id, deal.counterparty.object_id, deal.book.object_id])
     assert spy["reads"] == [{"Deal": 1, "Counterparty": 1, "TradingBook": 1}]
@@ -291,6 +375,23 @@ def test_parquet_by_value_raises(tmp_path):
         store.write([deal], by_reference=False)
 
 
+def test_self_reference(store):
+    head = Node(name="a", next=Node(name="b", next=Node(name="c")))
+    head.write(store)
+    assert Node.read(store, name="a") == head
+
+
+@pytest.mark.parametrize("length", [1, 2, 3])
+def test_reference_cycle_raises(store, tmp_path, length):
+    nodes = [Node(name=str(i)) for i in range(length)]
+    for node, next_node in zip(nodes, nodes[1:] + nodes[:1], strict=True):
+        node.next = next_node
+
+    with pytest.raises(ValueError, match="Reference cycle: Node/"):
+        store.write(nodes[:1])
+    assert not [p for p in tmp_path.rglob("*") if p.is_file()]  # Nothing written
+
+
 def test_plain_union(store):
     plain = PlainUnion(name="p", value="text")
     if store.record_format is RecordFormat.Parquet:
@@ -315,8 +416,7 @@ def test_union_suggestion(hint, suggestion):
         persistable_arrow_converter().arrow_type(hint)
 
 
-# Field type support, by format. Known failures are strict xfails, so fixing one fails the run until
-# its mark is removed
+# Field type support, by format
 
 
 class Colour(StrEnum):
@@ -334,7 +434,7 @@ class Size(IntEnum):
 Json, Parquet = RecordFormat.Json, RecordFormat.Parquet
 naive = dt.datetime(2026, 1, 2, 3, 4, 5, 6)
 
-# label: (field type, value, {format: (failure reason, exception raised)})
+# label: (field type, value, {format: exception raised on write})
 FIELD_TYPES = {
     "decimal": (Decimal, Decimal("12.50"), {}),
     "decimal_constrained": (
@@ -347,7 +447,7 @@ FIELD_TYPES = {
     "naive_datetime": (
         dt.datetime,
         naive,
-        {Parquet: ("datetime is stored as UTC: use NaiveDatetime", AssertionError)},
+        {Parquet: ValueError},  # A plain datetime is stored as UTC: use NaiveDatetime
     ),
     "naive_datetime_annotated": (NaiveDatetime, naive, {}),
     "aware_datetime": (dt.datetime, naive.replace(tzinfo=dt.UTC), {}),
@@ -388,25 +488,26 @@ def _field_type_params():
         registry.register(holder.__name__, holder)
 
         for record_format in RecordFormat:
-            marks = ()
-            if (failure := failures.get(record_format)) is not None:
-                reason, raises = failure
-                marks = pytest.mark.xfail(strict=True, reason=reason, raises=raises)
             yield pytest.param(
                 holder,
                 value,
                 record_format,
+                failures.get(record_format),
                 id=f"{label}-{record_format.name}",
-                marks=marks,
             )
 
 
 @pytest.mark.parametrize(
-    ("holder", "value", "record_format"), list(_field_type_params())
+    ("holder", "value", "record_format", "raises"), list(_field_type_params())
 )
-def test_field_type_round_trip(tmp_path, holder, value, record_format):
+def test_field_type_round_trip(tmp_path, holder, value, record_format, raises):
     store = FSStore(f"file://{tmp_path}", record_format=record_format)
     obj = holder(name="x", value=value)
+    if raises is not None:
+        with pytest.raises(raises):
+            obj.write(store)
+        return
+
     obj.write(store)
 
     read = holder.read(store, name="x")
@@ -422,6 +523,32 @@ class Host(Identifiable):
 
 
 registry.register(Host.__name__, Host)
+
+
+@dataclass
+class Evolving(Identifiable):
+    name: IdField[str]
+    added: int = 7  # Added after the first version was written
+
+
+registry.register(Evolving.__name__, Evolving)
+
+
+def test_parquet_added_field_defaults(tmp_path):
+    url = f"file://{tmp_path}"
+    # Writes Evolving as it was before the added field
+    before = persistable_arrow_converter()
+    before.add_struct(lambda t: {"name": IdField[str]} if t is Evolving else None)
+    Evolving(name="old", added=1).write(FSStore(url, arrow_converter=before))
+
+    store = FSStore(url)
+    new = Evolving(name="new", added=2)
+    new.write(store)
+
+    # One read of both files
+    old_id = Evolving(name="old").object_id
+    read = store.read([old_id, new.object_id])
+    assert read == {old_id: Evolving(name="old"), new.object_id: new}
 
 
 def test_parquet_custom_type(tmp_path):

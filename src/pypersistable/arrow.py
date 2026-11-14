@@ -59,9 +59,9 @@ class ArrowConverter:
     def __init__(self):
         self.__handlers: list[TypeHandler] = []
         self.__structs: list[StructFields] = [pydantic_fields, dataclass_fields]
-        # Checked in order, so subclasses precede their bases. A plain datetime is stored as UTC: aware values keep
-        # their instant, naive ones are read back as UTC. Use pydantic's NaiveDatetime for no time zone
-        self.__types: dict[type, tuple[pa.DataType, Callable[[Any], Any] | None]] = { # pyright: ignore[reportAttributeAccessIssue]
+        # Checked in order, so subclasses precede their bases. A plain datetime is stored as UTC, keeping the instant:
+        # it must be aware (see arrow_value). Use pydantic's NaiveDatetime for no time zone
+        self.__types: dict[type, tuple[pa.DataType, Callable[[Any], Any] | None]] = {  # pyright: ignore[reportAttributeAccessIssue]
             NaiveDatetime: (pa.timestamp("us"), None),
             AwareDatetime: (pa.timestamp("us", tz="UTC"), None),
             bool: (pa.bool_(), None),
@@ -148,20 +148,36 @@ class ArrowConverter:
 
         raise UnsupportedTypeError(f"Unsupported type {hint}")
 
-    def arrow_value(self, value: Any) -> Any:
-        """Plain python data, e.g. pydantic's python mode serialisation, as pyarrow accepts it.
+    def arrow_value(self, value: Any, arrow_type: pa.DataType) -> Any:
+        """Plain python data, e.g. pydantic's python mode serialisation, as pyarrow accepts it for arrow_type.
 
-        Structs must already be dicts: they are not converted.
+        Structs must already be dicts: they are not converted. Raises ValueError for a naive datetime with a time zone
+        aware arrow_type, which pyarrow would otherwise silently treat as UTC.
         """
-        match value:
-            case dict():
-                return {
-                    self.arrow_value(k): self.arrow_value(v) for k, v in value.items()
-                }
-            case list() | tuple() | set() | frozenset():
-                return [self.arrow_value(v) for v in value]
-            case Enum():
-                return self.arrow_value(value.value)
+        if value is None:
+            return None
+        if pa.types.is_struct(arrow_type):
+            return {
+                f.name: self.arrow_value(value.get(f.name), f.type) for f in arrow_type
+            }
+        if pa.types.is_map(arrow_type):
+            key_type, item_type = arrow_type.key_type, arrow_type.item_type
+            return {
+                self.arrow_value(k, key_type): self.arrow_value(v, item_type)
+                for k, v in value.items()
+            }
+        if pa.types.is_list(arrow_type):
+            return [self.arrow_value(v, arrow_type.value_type) for v in value]
+        if isinstance(value, Enum):
+            value = value.value
+        if (
+            pa.types.is_timestamp(arrow_type)
+            and arrow_type.tz is not None
+            and value.utcoffset() is None
+        ):
+            raise ValueError(
+                f"Naive datetime {value} for a time zone aware timestamp: use NaiveDatetime for no time zone"
+            )
 
         typ = type(value)
         if typ not in self.__to_arrow:

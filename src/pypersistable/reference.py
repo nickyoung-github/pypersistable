@@ -42,7 +42,8 @@ class ReferenceResolver:
 class ReferenceCollector:
     """Collects referenced objects when writing, so that they are persisted too.
 
-    Each object's id is computed once, however often it is referenced.
+    Each object's id is computed once, however often it is referenced. Set referrer to the id of the object being
+    serialised to record what it references in graph.
     """
 
     def __init__(self):
@@ -50,6 +51,8 @@ class ReferenceCollector:
         self.__ids: dict[int, PersistableId] = {}
         self.__seen: set[PersistableId] = set()
         self.__new: dict[PersistableId, Persistable] = {}
+        self.referrer: PersistableId | None = None
+        self.graph: dict[PersistableId, set[PersistableId]] = {}
 
     def add(self, obj: Persistable) -> PersistableId:
         if (object_id := self.__ids.get(id(obj))) is None:
@@ -57,6 +60,9 @@ class ReferenceCollector:
             if object_id not in self.__seen:
                 self.__seen.add(object_id)
                 self.__new[object_id] = obj
+
+        if self.referrer is not None:
+            self.graph.setdefault(self.referrer, set()).add(object_id)
 
         return object_id
 

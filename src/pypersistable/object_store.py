@@ -8,6 +8,10 @@ from typing import Any, ClassVar, Self
 from .persistable_id import PersistableId
 
 
+class WriteConflictError(Exception):
+    """Writing an object would overwrite a version of it which the writer has not seen"""
+
+
 class UnknownObjectError(KeyError):
     def __init__(self, typ: type, kwargs: dict[str, Any], object_id: PersistableId):
         self.typ = typ
@@ -32,7 +36,7 @@ class ObjectStore:
         self,
         objects: Iterable[Any],
         effective_time: dt.datetime = dt.datetime.max,
-        check: bool = True,
+        force_overwrite: bool = False,
         by_reference: bool = True,
     ): ...
 
@@ -51,7 +55,9 @@ class ReadBatch:
 
     def __init__(self):
         self.__pending: dict[_ReadKey, tuple[ObjectStore, set[PersistableId]]] = {}
-        self.__tasks: dict[_ReadKey, asyncio.Future[dict[PersistableId, Any]]] | None = None
+        self.__tasks: (
+            dict[_ReadKey, asyncio.Future[dict[PersistableId, Any]]] | None
+        ) = None
 
     @classmethod
     def current(cls) -> Self:

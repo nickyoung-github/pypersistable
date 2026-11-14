@@ -41,15 +41,28 @@ _ID_ONLY = "id_only"
 
 
 class Persistable(ABC):
+    __object_entry_time = None  # Not annotated, so that it is not a field
+
     def __hash__(self):
         return hash(self.object_id)
+
+    @property
+    def object_entry_time(self) -> dt.datetime | None:
+        """The entry time of the persisted version of this object, if it was read or written, else None"""
+        return self.__object_entry_time
+
+    def _set_object_entry_time(self, entry_time: dt.datetime):
+        # Not setattr, which frozen dataclasses disallow
+        object.__setattr__(self, "_Persistable__object_entry_time", entry_time)
 
     @classmethod
     def __get_pydantic_core_schema__(
         cls, source: Any, handler: GetCoreSchemaHandler
     ) -> CoreSchema:
         def serialise(
-            value: Persistable, serialiser: SerializerFunctionWrapHandler, info: SerializationInfo
+            value: Persistable,
+            serialiser: SerializerFunctionWrapHandler,
+            info: SerializationInfo,
         ) -> Any:
             # With id_only in the context, nested Persistables serialise as their object_id. Its value is
             # the root object being serialised, which is exempt: a Unique is its own id_type
@@ -60,8 +73,10 @@ class Persistable(ABC):
 
         return {
             **handler(source),
-            "serialization": core_schema.wrap_serializer_function_ser_schema(serialise, info_arg=True),
-        } # pyright: ignore[reportReturnType]
+            "serialization": core_schema.wrap_serializer_function_ser_schema(
+                serialise, info_arg=True
+            ),
+        }  # pyright: ignore[reportReturnType]
 
     @classmethod
     @abstractmethod
@@ -79,7 +94,9 @@ class Persistable(ABC):
         # source is either the id fields, as a dict, or an instance of id_type
         adapter = cls.__id_adapter()
         id_value = adapter.validate_python(source)
-        values = adapter.dump_python(id_value, mode="json", context={_ID_ONLY: id_value})
+        values = adapter.dump_python(
+            id_value, mode="json", context={_ID_ONLY: id_value}
+        )
         name = sha512(dumps(values, option=OPT_SORT_KEYS)).hexdigest()
 
         return PersistableId(name, typ=cls)
@@ -138,14 +155,32 @@ class Persistable(ABC):
         except KeyError:
             raise UnknownObjectError(cls, kwargs, object_id) from None
 
-    def write(self, db: ObjectStore):
-        db.write([self])
+    def write(
+        self,
+        db: ObjectStore,
+        effective_time: dt.datetime = dt.datetime.max,
+        force_overwrite: bool = False,
+        by_reference: bool = True,
+    ) -> None:
+        db.write(
+            [self],
+            effective_time=effective_time,
+            force_overwrite=force_overwrite,
+            by_reference=by_reference,
+        )
+
+
+def _check_id_type(cls: type[Persistable]):
+    try:
+        cls.id_type()  # Validates the id fields
+    except NameError:
+        pass  # A forward reference, e.g. to cls itself, which is not defined yet: validated on first use instead
 
 
 class Identifiable(Persistable):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        cls.id_type()  # Validates the id fields
+        _check_id_type(cls)
 
     @classmethod
     @typed_cache
@@ -174,9 +209,15 @@ class Identifiable(Persistable):
 class Unique(Persistable):
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if init_vars := [n for n, h in get_type_hints(cls).items() if isinstance(h, InitVar)]:
-            raise TypeError(f"{cls!r}: a Unique cannot have InitVars: {', '.join(init_vars)}")
+        _check_id_type(cls)
 
     @classmethod
+    @typed_cache
     def id_type(cls) -> type[Self]:
+        if init_vars := [
+            n for n, h in get_type_hints(cls).items() if isinstance(h, InitVar)
+        ]:
+            raise TypeError(
+                f"{cls!r}: a Unique cannot have InitVars: {', '.join(init_vars)}"
+            )
         return cls

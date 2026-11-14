@@ -60,15 +60,40 @@ def persistable_arrow_converter() -> ArrowConverter:
 _ARROW_CONVERTER = persistable_arrow_converter()
 
 
+def _drop_absent(value: Any, arrow_type: pa.DataType, file_type: pa.DataType) -> Any:
+    # Drops the struct fields of arrow_type absent from file_type, i.e. those added since the file was written, which
+    # union_by_name and casting fill with nulls: pydantic then applies their defaults
+    if value is None or arrow_type == file_type:
+        return value
+    if pa.types.is_struct(arrow_type):
+        file_fields = {f.name: f.type for f in file_type}
+        return {
+            name: _drop_absent(v, arrow_type.field(name).type, file_fields[name])
+            for name, v in value.items()
+            if name in file_fields
+        }
+    if pa.types.is_map(arrow_type):
+        return {
+            k: _drop_absent(v, arrow_type.item_type, file_type.item_type)
+            for k, v in value.items()
+        }
+    if pa.types.is_list(arrow_type):
+        return [
+            _drop_absent(v, arrow_type.value_type, file_type.value_type) for v in value
+        ]
+    return value
+
+
 class FSStore(PersistableStore):
     def __init__(
         self,
         url: str,
         record_format: RecordFormat = RecordFormat.Parquet,
         arrow_converter: ArrowConverter | None = None,
+        require_load_of_existing: bool = False,
     ):
         """arrow_converter: for Parquet, defaults to persistable_arrow_converter()"""
-        super().__init__(record_format)
+        super().__init__(record_format, require_load_of_existing)
         self.__arrow = arrow_converter or _ARROW_CONVERTER
         self.__fs, root = url_to_fs(url)
         self.__root = Path(root)
@@ -108,7 +133,7 @@ class FSStore(PersistableStore):
         for typ, object_ids in by_type.items():
             files = f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
             source = (
-                f"read_parquet('{files}', union_by_name = true)"
+                f"read_parquet('{files}', union_by_name = true, filename = true)"
                 if parquet
                 else f"read_json_objects('{files}', format = 'array')"
             )
@@ -134,8 +159,22 @@ class FSStore(PersistableStore):
                 # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own
                 # time zone
                 schema = self.__arrow.arrow_schema(self.record_type(typ))
-                table = relation.to_arrow_table().select(schema.names).cast(schema)
-                results[typ] = table.to_pylist(maps_as_pydicts="strict")
+                table = relation.to_arrow_table()
+                records = (
+                    table.select(schema.names)
+                    .cast(schema)
+                    .to_pylist(maps_as_pydicts="strict")
+                )
+                filenames = table["filename"].to_pylist()
+                file_types = {
+                    f: pa.struct(pq.read_schema(f, filesystem=self.__fs))
+                    for f in set(filenames)
+                }
+                record_type = pa.struct(schema)
+                results[typ] = [
+                    _drop_absent(r, record_type, file_types[f])
+                    for r, f in zip(records, filenames, strict=True)
+                ]
             else:
                 results[typ] = [row for (row,) in relation.fetchall()]
 
@@ -156,7 +195,8 @@ class FSStore(PersistableStore):
             if self.record_format is RecordFormat.Parquet:
                 schema = self.__arrow.arrow_schema(self.record_type(typ))
                 table = pa.Table.from_pylist(
-                    self.__arrow.arrow_value(records), schema=schema
+                    self.__arrow.arrow_value(records, pa.list_(pa.struct(schema))),
+                    schema=schema,
                 )
                 with pq.ParquetWriter(
                     f"{path}.parquet", schema, filesystem=self.__fs

@@ -1,24 +1,43 @@
-# pypersistable: persist python objects with minimal boilerplate
+# pypersistable: low effort persistence of python objects
 
-Any object that can be handled by `pydantic.TypeAdaptor` will work (pydantic models, dataclasses etc.)
-Objects can be persisted as JSON or parquet (with some caveats).
+`pypersistable` provides a mechanism for easily persisting python objects, with as little prescription as possible 
+as to how they are defined. It is primarily aimed at object models defined using the standard library `dataclass`.
 
+Any type that `pydantic.TypeAdapter` can handle (dataclasses, pydantic models etc.) can be made persistable.
+Objects are persisted as JSON or Parquet (with some caveats, see [Parquet](#parquet)). It could likely be extended
+to handle `attrs`, [msgspec](https://pypi.org/project/msgspec) etc quite easily.
+
+There are some components, such as [DiscriminatedUnion](#discriminatedunion) and [persistable_arrow_converter](#parquet
+which can be used standalone. These may be moved out to separate packages in future.
 
 ## Defining persistable objects
 
 ### `TypeRegistry`
-Persistable types must be registered with `TypeRegistry`. This can be done explicitly or using entry points.
+Persistable types must be registered with `TypeRegistry`, a singleton:
+
+```python
+from pathlib import Path
+from pypersistable import TypeRegistry
+
+TypeRegistry().register("Dog", Dog, root=Path("Animals"))
+```
+
+`register` also accepts an `importlib.metadata.EntryPoint`, which is only loaded when the type is needed.
 While we could have avoided a registry, the alternative is persisting implementation-specific info,
 such as the module and class names, making code refactoring very difficult.
-You can optionally supply a `root` parameter to group types, e.g., you might specify a root of `Animals`
-for classes `Dog`, `Cat`, `Bunyip` etc. See [DiscriminatedUnion](#discriminatedunion) for another use of root.
+The optional `root` groups types, e.g., you might specify a root of `Animals` for classes `Dog`, `Cat`, `Bunyip` etc.
+See [DiscriminatedUnion](#discriminatedunion) for another use of root.
 
 ### `Persistable`
-`Persistable` is the abstract base class for persistable objects. All it does it provide an `object_id`
-for serialisation and ways to form that id for retrieval. There are two species of `Persistable`:
+`Persistable` is the abstract base class for persistable objects. It provides an `object_id`, a `PersistableId`,
+which is the type's registered name and a hash of the object's id fields, e.g. `Dog/3f2a...`.
+Where an object's id fields contain other `Persistable` instances, only their `object_id` contribute to the parent id.
+
+There are two species of `Persistable`:
 
 - `Unique` - As the name suggests, this is the base for types where all fields form the id. E.g.,
 ```python
+@dataclass
 class Address(Unique):
     street_number: str  # Could be 221B, for example
     street_name: str
@@ -29,29 +48,39 @@ class Address(Unique):
 - `Identifiable` - A base class for objects where a subset of fields form their id. Such fields
 are declared using `IdField`. E.g.,
 ```python
+@dataclass
 class Customer(Identifiable):
     name: IdField[str]
     address: Address
 ```
 
+Either can equally be a pydantic `BaseModel`. `InitVar` is not allowed in id fields (or anywhere in a `Unique`),
+as they are not persisted: a `TypeError` is raised when the class is defined.
+
 ### `Reference`
 In classes which have user-defined types as attributes, do we want those nested objects to be persisted
 by value in the parent object's payload or saved separately, with the parent persisting a reference?
 The answer is very much, "it depends". If you definitely want the nested payload to be embedded, that is
-easy: simply declare your type like `Customer` above. However, you could instead re-write it as:
+easy: simply declare your type like `Customer` above. However, you could instead write it as:
 
 ```python
+@dataclass
 class Customer(Identifiable):
     name: IdField[str]
     address: Reference[Address]
 ```
 
 This means that if we had multiple customers (e.g. family members) living at the same address,
-when persisting those customers, the `Address` would be persisted once and shared, with a reference being
+when persisting those customers, the `Address` would be persisted once and shared, with its `object_id`
 saved in the `Customer` payload.
 
-You can force references to be serialised by value via the `by_reference` paramter on `ObjectStore.write`.
-`ObjectStore.read` will always check for persisted references.
+A `Reference` may be a union of `Persistable` types, e.g. `Reference[Dog | Cat]`, as the `object_id` identifies
+the type. `Reference` may also be optional or nested in containers, e.g. `tuple[Reference[Address], ...]`.
+A type may reference itself, e.g. `next: "Reference[Node] | None"`, but objects may not form a reference cycle:
+writing one raises a `ValueError`, as it could not be read back.
+
+When writing as JSON, you can force references to be serialised by value via the `by_reference` parameter of
+`Persistable.write`. Reading always resolves persisted references, loading them in one read per level of nesting.
 
 ### `DiscriminatedUnion`
 >`DiscriminatedUnion` works on all types, they do not need to be Persistable
@@ -63,52 +92,52 @@ often also get used in contexts where we need to know a schema, such as web serv
 A better approach is to declare the valid types using a python `Union`. pydantic can try and infer the
 actual type on deserialisation but it can be preferable to indicate that explicitly. I got tired of trying to use
 half-baked implementations from Stack Overflow so I wrote `DiscriminatedUnion`, which does this by:
-- Adding a type specifier to the JSON schema 
-- Adding that type specifier to the serialisation paylod (the type's module and qualified name - no need for the type registry as the union tells us the type)
+- Adding a type specifier to the JSON schema
+- Adding that type specifier to the serialisation payload (the type's module and qualified name - no need for the
+  type registry as the union tells us the type)
 - Extracting and removing the type specifier from the deserialisation payload and selecting the appropriate type
+
+```python
+@dataclass
+class Kennel(Identifiable):
+    name: IdField[str]
+    pet: DiscriminatedUnion[Dog, Cat]
+```
 
 `DiscriminatedUnion` can be combined with `__subclasses__` to implement a rather hacky polymorphism, with two
 major caveats:
-1. The static type checkers like pyright do not like it as the type is determined at runtime
-2. You need to ensure that all subclasses or your base have been imported
+1. Static type checkers like pyright do not like it as the type is determined at runtime
+2. You need to ensure that all subclasses of your base have been imported
 
 For `Persistable` types `TypeRegistry.types_for_root` can help with 2., e.g.:
 
 ```python
-Animals = DiscriminatedUnion[TypeRegistry.types_for_root("Animals")]
+Animals = DiscriminatedUnion[TypeRegistry().types_for_root(Path("Animals"))]
 ```
 
 ## Storing persistable objects
 
 `ObjectStore` is an abstract base class for implementing an object store, such as a database.
-A file system-based store `FSStore` is provided. Objects are written into directories, formed
+A file system-based store, `FSStore`, is provided. Objects are written into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
-Each write creates a new file, whose name is the timestamp of the write, which corresponds to
-`MetaData.entry_time` in the persisted record.
+Each write creates a new file per type, named by the timestamp of the write, which corresponds to
+`entry_time` in the persisted record's metadata.
 
-Reading uses `duckdb` to read the stored parquet/json files. Currently only querying by an object's id
+Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.
 
 A nightly job to compact the timestamped files into a single file will improve read performance.
 
 `FSStore` uses [fsspec](https://pypi.org/project/fsspec/), which supports a wide range of file systems.
-For parquet schema generation it uses [anyschema](https://pypi.org/project/anyschema/), extended with
-some handling for dataclasses and references.
-
-> [Note]
-> Parquet cannot handle union types natively. Currently they are only support via a `Reference`, e.g.:
-
-```python
-class Foo:
-    animal: Reference[Union[Dog, Cat, Wildebeest]]
-```
 
 ### Writing
 
 ```python
-store = FSStore(r"file:///users/hades/ObjectStore", format=FSStoreFormat.Parquet)
+from pypersistable import FSStore, RecordFormat
+
+store = FSStore("file:///users/hades/ObjectStore", record_format=RecordFormat.Parquet)  # Parquet is the default
 best_boy = Dog(name="Cerberus")
-store.write([best_boy])
+best_boy.write(store)
 ```
 
 Will result in:
@@ -117,23 +146,23 @@ Will result in:
 /users/hades/ObjectStore                               # FSStore root
     /Animals                                           # TypeRegistry root
         /Dog                                           # TypeRegistry registered_name
-            /2026-11-08T13:01:55.249821+00:00.parquet  # File name
+            /2026-11-08T13~01~55.249821+00~00.parquet  # File name (: is replaced, as not valid on all file systems)
 ```
 
-If you save an object which contains references, multiple objects may be created:
+If you save an object which contains references, multiple objects may be written:
 
 ```python
 blofeld = Customer(
     name="Blofeld, Ernst S.",
     address=Address(
-        street_numer=1,
+        street_number="1",
         street_name="The Hollowed Out Volcano",
         town="",
         postcode="HV1 1ZZ",
-        country=Country.Krakatoa
-    )
+        country=Country.Krakatoa,
+    ),
 )
-store.write([blofeld])
+blofeld.write(store)
 ```
 
 This would create:
@@ -141,16 +170,114 @@ This would create:
 ```
 /users/hades/ObjectStore                           # FSStore root
     /Customer                                      # TypeRegistry registered_name
-        /2026-11-08T13:01:55.249821+00:00.parquet  # File name
+        /2026-11-08T13~01~55.249821+00~00.parquet  # File name
     /Address                                       # TypeRegistry registered_name
-        /2026-11-08T13:01:55.249821+00:00.parquet  # File name
+        /2026-11-08T13~01~55.249821+00~00.parquet  # File name
 ```
 
-#### Reading
-Objects are read by creating an id with `make_object_id`:
+#### Overwriting
+Each object read or written records the entry time of its persisted version, as `object_entry_time`
+(`None` for an object constructed anew, or by `dataclasses.replace`). `write` checks the objects written, and those
+they reference, against their persisted versions:
+
+- Unchanged objects are not written again
+- An object which is out of date, i.e. persisted since its version (e.g. by someone else), raises a
+  `WriteConflictError`
+- If the store requires it (`require_load_of_existing=True`), an object which is persisted but was not read or written,
+  e.g. one constructed from its id fields, raises a `WriteConflictError`, rather than overwriting the persisted version
 
 ```python
-best_boy_id = Dog.make_object_id(name="Cerberus")
-loaded = store.read([best_boy_id])
-best_boy = loaded[best_boy_id]
+store = FSStore("s3://prod/ObjectStore", require_load_of_existing=True)
 ```
+
+`write(..., force_overwrite=True)` asks the store to write such objects anyway. How a store treats this is up to it:
+`FSStore` warns and writes them.
+
+### Reading
+Read an object by its type and id fields with `Persistable.read`:
+
+```python
+best_boy = Dog.read(store, name="Cerberus")
+address = Address.read(store, street_number="1", ...)  # A Unique's id fields are all its fields
+```
+
+`UnknownObjectError` (a `KeyError`) is raised if there is no such object.
+Unknown or missing id fields raise a pydantic `ValidationError`.
+
+To read several objects, possibly of different types, in one go, pass `is_async=True` to get coroutines and await them
+together. Reads from the same store (as of the same times) are batched into one `ObjectStore.read`:
+
+```python
+best_boy, blofeld = store.read_all(
+    Dog.read(store, name="Cerberus", is_async=True),
+    Customer.read(store, name="Blofeld, Ernst S.", is_async=True),
+)
+```
+
+`read_all` runs them with `asyncio.run`, or on the `loop` you supply. Within your own async code, use e.g.
+`asyncio.gather`.
+
+`ObjectStore.read` reads by `PersistableId`, returning a dict of the objects found:
+
+```python
+loaded = store.read([best_boy.object_id, blofeld.object_id])
+```
+
+### Bitemporality
+Each record has an `effective_time`, when it takes effect, and an `entry_time`, when it was written. Pass
+`effective_time` to `write` (it defaults to the entry time), and `effective_time` and/or `entry_time` to the read
+methods to read the latest version as of those times:
+
+```python
+Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))  # As we knew it on 1 January
+```
+
+### JSON
+Records are written as a JSON array. `bytes` are base64-encoded.
+
+### Parquet
+>`persistable_arrow_converter` (in `pypersistable.arrow`) can be used standalone, it does not depend on `Persistable` behaviour
+>and can be extended with user-defined custom behaviour
+
+The Parquet schema is generated from the type hints, with:
+
+- Plain `datetime`s stored as UTC timestamps, keeping their instant: writing a naive value raises a `ValueError`.
+  Use pydantic's `NaiveDatetime` for a timestamp without a time zone (or `AwareDatetime` to validate as aware)
+- `Decimal`s as `decimal128`, with the precision and scale from pydantic's `max_digits`/`decimal_places`
+  if given, else (38, 18)
+- `Enum` and `Literal` stored as their values, which must be of one type
+- `tuple`, `set` and `frozenset` as lists, whose items must be of one type
+- `dict` as maps
+- `UUID` as strings
+- `Reference` as the referenced object's `object_id`, so `by_reference=False` is not supported
+- `DiscriminatedUnion` as a struct of the type specifier and a nullable field per member
+
+Parquet has no union type: other than `T | None`, unions must be a `Reference` (of `Persistable`) or a
+`DiscriminatedUnion`. Unsupported types raise `UnsupportedTypeError`.
+
+Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
+Renaming fields, or changing their types, is not supported.
+
+#### Custom types
+- `add_type(typ, arrow_type, to_arrow=None)`: store `typ` (and its subclasses) as `arrow_type`, with `to_arrow`
+  converting values pyarrow does not accept
+- `add_struct(fields)`: `fields(typ)` returns the `{name: type hint}` of the struct-like types it handles, else `None`
+  (e.g. for attrs classes or msgspec Structs)
+- `add_handler(handler)`: `handler(converter, hint, metadata)` returns the Arrow type for the type hints (and their
+  `Annotated` metadata) it handles, else `None`
+
+Those added most recently take precedence. `persistable_arrow_converter()` returns one with the handling for
+`Reference` and `DiscriminatedUnion`, to extend and pass to `FSStore`:
+
+```python
+from ipaddress import IPv4Address
+
+import pyarrow as pa
+from pypersistable import FSStore, persistable_arrow_converter
+
+converter = persistable_arrow_converter()
+converter.add_type(IPv4Address, pa.string(), str)
+store = FSStore("file:///users/hades/ObjectStore", arrow_converter=converter)
+```
+
+Note this covers the Parquet schema only: pydantic must also be able to validate and serialise the type.

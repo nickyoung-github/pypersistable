@@ -1,15 +1,19 @@
 import asyncio
 import datetime as dt
+import getpass
+import socket
+import warnings
 from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, make_dataclass
 from enum import Enum, auto
 from functools import cache
+from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from pydantic import ConfigDict, TypeAdapter
 
 from .discriminated_union import STRUCT_LAYOUT
-from .object_store import ObjectStore
+from .object_store import ObjectStore, WriteConflictError
 from .persistable import Persistable
 from .persistable_id import PersistableId
 from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolver
@@ -36,8 +40,14 @@ class RecordFormat(Enum):
 
 
 class PersistableStore(ObjectStore):
-    def __init__(self, record_format: RecordFormat):
+    def __init__(
+        self,
+        record_format: RecordFormat,
+        require_load_of_existing: bool = False,
+    ):
+        """require_load_of_existing: whether writing over a persisted object requires having read (or written) it"""
         self.__record_format = record_format
+        self.__require_load_of_existing = require_load_of_existing
 
     @property
     def record_format(self) -> RecordFormat:
@@ -106,7 +116,7 @@ class PersistableStore(ObjectStore):
                 if resolver.misses > misses:
                     unresolved.append((validate, result))
                 else:
-                    ret[PersistableId.parse(record.object_id)] = record.data
+                    ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
 
         if unresolved:
             # Load the references in one read, as of the same times, except those this read has already loaded
@@ -119,15 +129,20 @@ class PersistableStore(ObjectStore):
             resolver.resolved.update(loaded)
             for validate, result in unresolved:
                 record = validate(result, context=context)
-                ret[PersistableId.parse(record.object_id)] = record.data
+                ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
 
         return ret
+
+    @staticmethod
+    def __loaded(record: ObjectRecord) -> Persistable:
+        record.data._set_object_entry_time(record.metadata.entry_time)
+        return record.data
 
     def write(
         self,
         objects: Iterable[Persistable],
         effective_time: dt.datetime = dt.datetime.max,
-        check: bool = True,
+        force_overwrite: bool = False,
         by_reference: bool = True,
     ):
         parquet = self.__record_format is RecordFormat.Parquet
@@ -142,8 +157,8 @@ class PersistableStore(ObjectStore):
             if effective_time != dt.datetime.max
             else entry_time,
             entry_time=entry_time,
-            host="nick-host",
-            user="nick",
+            host=socket.gethostname(),
+            user=getpass.getuser(),
         )
 
         # Serialise the objects and, if by_reference, those they reference, collected as each is serialised
@@ -165,25 +180,51 @@ class PersistableStore(ObjectStore):
                 record, mode="python" if parquet else "json", context=context
             )
 
+        objs: dict[PersistableId, Persistable] = {}
         records: dict[PersistableId, dict[str, Any]] = {}
         while new := collector.take():
+            objs.update(new)
             for object_id, obj in new.items():
+                collector.referrer = object_id
                 records[object_id] = dump(object_id, obj, context)
 
-        if check:
+        try:
+            TopologicalSorter(collector.graph).prepare()
+        except CycleError as e:
+            # Could not be read: each object must be constructed before those referencing it
+            raise ValueError(
+                f"Reference cycle: {' -> '.join(map(str, e.args[1]))}"
+            ) from None
+
+        versions: dict[
+            PersistableId, dt.datetime
+        ] = {}  # Of the objects written or found unchanged
+        conflicts: list[str] = []
+        current = self.read(records)
+        check_context = (
+            {**context, COLLECTOR: ReferenceCollector()} if by_reference else context
+        )
+
+        for i, stored in current.items():
+            version, latest = objs[i].object_entry_time, stored.object_entry_time
             # Compare serialised data, in which references are ids: a change to a referenced object is not a change
-            current = self.read(records)
-            check_context = (
-                {**context, COLLECTOR: ReferenceCollector()}
-                if by_reference
-                else context
-            )
-            records = {
-                i: record
-                for i, record in records.items()
-                if i not in current
-                or dump(i, current[i], check_context)["data"] != record["data"]
-            }
+            if dump(i, stored, check_context)["data"] == records[i]["data"]:
+                del records[i]
+                versions[i] = latest  # pyright: ignore[reportArgumentType]
+            elif version is None:
+                if self.__require_load_of_existing:
+                    conflicts.append(
+                        f"{i}, written at {latest}, was not read before being written"
+                    )
+            elif version != latest:
+                conflicts.append(
+                    f"{i} was written at {latest}, since the version written at {version}"
+                )
+
+        if conflicts:
+            if not force_overwrite:
+                raise WriteConflictError("; ".join(conflicts))
+            warnings.warn(f"Overwriting: {'; '.join(conflicts)}", stacklevel=2)
 
         by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
         for object_id, record in records.items():
@@ -191,6 +232,10 @@ class PersistableStore(ObjectStore):
 
         if by_type:
             self._write(by_type, entry_time)
+
+        versions.update(dict.fromkeys(records, entry_time))
+        for object_id, version in versions.items():
+            objs[object_id]._set_object_entry_time(version)
 
     @staticmethod
     def read_all(

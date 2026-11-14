@@ -10,6 +10,7 @@ from models import (
     ModelAddress,
     ModelBook,
     ModelCounterparty,
+    NoIds,
     Option,
     Pair,
     ReferenceBook,
@@ -20,8 +21,13 @@ from models import (
 from orjson import OPT_SORT_KEYS, dumps
 from pydantic import TypeAdapter, ValidationError
 
-from pypersistable import Identifiable, IdField, PersistableId, Unique
-from pypersistable.object_store import UnknownObjectError
+from pypersistable import (
+    Identifiable,
+    IdField,
+    PersistableId,
+    Unique,
+    UnknownObjectError,
+)
 
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
@@ -155,6 +161,12 @@ def test_identifiable_without_id_fields_raises():
         @dataclass
         class NoIds(Identifiable):
             name: str
+
+
+def test_forward_reference_defers_id_field_check():
+    # NoIds was defined without error: its forward reference to itself was unresolvable then
+    with pytest.raises(TypeError, match="does not define any id fields"):
+        NoIds.id_type()
 
 
 def test_id_field_init_var_raises():

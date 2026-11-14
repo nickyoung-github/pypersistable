@@ -117,6 +117,17 @@ class PlainUnion(Identifiable):
     value: int | str
 
 
+@dataclass(kw_only=True)
+class Node(Identifiable):
+    # Mutable, so that a reference cycle can be made. A forward reference to itself: id_type is checked on first use
+    name: IdField[str]
+    next: "Reference[Node] | None" = None
+
+
+class NoIds(Identifiable):
+    other: "NoIds | None" = None  # A forward reference, deferring the id field check
+
+
 for _typ in (
     Counterparty,
     TradingBook,
@@ -133,6 +144,7 @@ for _typ in (
     Deal,
     ModelDeal,
     PlainUnion,
+    Node,
 ):
     registry.register(_typ.__name__, _typ)
 
