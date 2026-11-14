@@ -341,6 +341,17 @@ def test_reference_to_deleted_resolves(store):
     assert Node.read(store, name="a") == head
 
 
+def test_write_restores_deleted_reference(store, spy):
+    head = Node(name="a", next=Node(name="b"))
+    head.write(store)
+    head.next.delete(store)
+
+    # Unchanged itself, but writes the deleted object it references, restoring it
+    head.write(store)
+    assert spy["writes"][-1] == {"Node": 1}
+    assert Node.read(store, name="b") == head.next
+
+
 def test_require_load_of_existing_delete(strict_store):
     Node(name="a").write(strict_store)
     with pytest.raises(WriteConflictError, match="was not read"):

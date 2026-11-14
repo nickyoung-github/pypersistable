@@ -227,7 +227,8 @@ loaded = store.read([best_boy.object_id, blofeld.object_id])
 ### Deleting
 `Persistable.delete` (or `ObjectStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
 a new version of their persisted data with `active=False`. Reads no longer find them, but their data is kept: reads
-as of earlier times still do, and references to them still resolve. Writing a deleted object again restores it.
+as of earlier times still do, and references to them still resolve. Writing a deleted object again restores it,
+as does writing an object which references it.
 
 ```python
 best_boy.delete(store)
