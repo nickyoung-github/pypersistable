@@ -94,11 +94,8 @@ def _drop_absent(value: Any, arrow_type: pa.DataType, file_type: pa.DataType) ->
             k: _drop_absent(v, arrow_type.item_type, file_type.item_type)
             for k, v in value.items()
         }
-    if pa.types.is_list(arrow_type):
-        return [
-            _drop_absent(v, arrow_type.value_type, file_type.value_type) for v in value
-        ]
-    return value
+    # A list: other types differing are incompatible, raised reading
+    return [_drop_absent(v, arrow_type.value_type, file_type.value_type) for v in value]
 
 
 def _differences(
@@ -162,7 +159,9 @@ class FSStore(PersistableStore):
         self.__conn.register_filesystem(self.__fs)
         # Schemas of Parquet files by path, which are never rewritten
         self.__file_types: dict[str, pa.StructType] = {}
-        self.__checked_files: set[str] = set()  # For ignored fields, when read
+        self.__checked_files: set[str] = (
+            set()
+        )  # Compatible, ignored fields warned of, when read
         # Types whose schemas have been checked, on their first write. A redefined type is checked again
         self.__checked_types: set[type[Persistable]] = set()
 
@@ -242,14 +241,12 @@ class FSStore(PersistableStore):
                 "*",
                 "read_parquet(?, union_by_name = true, filename = true)",
             )
-            columns = {"object_id": "object_id"} | {
-                f: f"metadata.{f}" for f in ("effective_time", "entry_time")
-            }
+            columns = {f: f for f in ("object_id", "effective_time", "entry_time")}
         else:
             # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
             select, source = "json", "read_json_objects(?, format = 'array')"
             columns = {"object_id": "json->>'$.object_id'"} | {
-                f: f"(json->>'$.metadata.{f}')::TIMESTAMPTZ"
+                f: f"(json->>'$.{f}')::TIMESTAMPTZ"
                 for f in ("effective_time", "entry_time")
             }
 
@@ -276,16 +273,22 @@ class FSStore(PersistableStore):
             else pa.nulls(len(table), f.type)
             for f in schema
         }
-        records = pa.table(columns).cast(schema).to_pylist(maps_as_pydicts="strict")
         filenames = table["filename"].to_pylist()
-
+        # Before casting, which would convert values whose types have changed
         for f in set(filenames) - self.__checked_files:
+            incompatible, ignored = self.__differences(typ, f)
+            if incompatible:
+                raise IncompatibleSchemaError(
+                    f"{typ.__qualname__} cannot read {f}: {'; '.join(incompatible)}"
+                )
             self.__checked_files.add(f)
-            if ignored := self.__differences(typ, f)[1]:
+            if ignored:
                 warnings.warn(
                     f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
                     stacklevel=2,
                 )
+
+        records = pa.table(columns).cast(schema).to_pylist(maps_as_pydicts="strict")
 
         record_type = pa.struct(schema)
         return [

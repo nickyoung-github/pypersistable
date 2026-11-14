@@ -1,3 +1,4 @@
+from importlib.metadata import EntryPoint
 from pathlib import Path
 
 import pytest
@@ -34,3 +35,29 @@ def test_register_replace():
     assert registry.types_for_root(Path("old")) == ()
     with pytest.raises(UnregisteredTypeError):
         registry.registered_name(Old)
+
+
+class EntryPointTarget: ...
+
+
+def test_register_entry_point():
+    registry = TypeRegistry()
+    entry_point = EntryPoint("target", f"{__name__}:EntryPointTarget", "pypersistable")
+    registry.register("TestEntryPoint", entry_point)
+    assert registry.get_type("TestEntryPoint") is EntryPointTarget
+    assert registry.registered_name(EntryPointTarget) == "TestEntryPoint"
+    # Registered already, by its entry point
+    with pytest.raises(RegistrationError):
+        registry.register("TestEntryPointAgain", EntryPointTarget)
+
+    class Replacement: ...
+
+    registry.register("TestEntryPoint", Replacement, replace=True)
+    assert registry.get_type("TestEntryPoint") is Replacement
+    with pytest.raises(UnregisteredTypeError):
+        registry.registered_name(EntryPointTarget)
+
+
+def test_unknown_root_raises():
+    with pytest.raises(UnregisteredTypeError):
+        TypeRegistry().types_for_root(Path("test-unknown-root"))

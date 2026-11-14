@@ -1,4 +1,5 @@
 from dataclasses import dataclass  # noqa: N999
+from tempfile import TemporaryDirectory
 
 from pypersistable import (
     FSStore,
@@ -33,10 +34,14 @@ registry.register("CustomerBook", CustomerBook)
 
 ctpy = Counterparty(name="Acme", location="NW3", contact_name="Nick")
 book = CustomerBook(counterparty=ctpy, sales_coverage=("Tweedledum", "Tweedledee"))
-root = r"file:///Users/Nick/ObjectStore"
+root = (
+    TemporaryDirectory()
+)  # Replace with your store's URL, e.g. s3://my-bucket/ObjectStore
 
 for store_format in (RecordFormat.Json, RecordFormat.Parquet):
-    store = FSStore(f"{root}/{store_format.name.lower()}", record_format=store_format)
+    store = FSStore(
+        f"file://{root.name}/{store_format.name.lower()}", record_format=store_format
+    )
     # This will cause both book and ctpy (because it is a reference) to be written
     book.write(store)
 

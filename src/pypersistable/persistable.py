@@ -1,9 +1,7 @@
 import datetime as dt
-from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from contextvars import ContextVar
 from dataclasses import InitVar, fields, make_dataclass
-from functools import cache
 from hashlib import sha512
 from typing import (
     Annotated,
@@ -23,13 +21,12 @@ from pydantic import (
     GetCoreSchemaHandler,
     SerializationInfo,
     SerializerFunctionWrapHandler,
-    TypeAdapter,
 )
 from pydantic_core import CoreSchema, PydanticSerializationError, core_schema
 
 from .object_store import ObjectStore, ReadBatch, UnknownObjectError
 from .persistable_id import PersistableId
-from .typed_cache import typed_cache
+from .typed_cache import type_adapter, typed_cache
 
 
 class _IdFieldIndicator: ...
@@ -45,7 +42,7 @@ _ID_ONLY = "id_only"
 _COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", default=())
 
 
-class Persistable(ABC):
+class Persistable:
     __object_entry_time = None  # Not annotated, so that it is not a field
 
     def __hash__(self):
@@ -84,20 +81,15 @@ class Persistable(ABC):
         }  # pyright: ignore[reportReturnType]
 
     @classmethod
-    @abstractmethod
     def id_type(cls) -> type:
         """The type identifying objects of this class: a generated dataclass of the id fields
         for an `Identifiable`, the class itself for a `Unique`."""
-
-    @classmethod
-    @cache
-    def __id_adapter(cls) -> TypeAdapter:
-        return TypeAdapter(cls.id_type())
+        raise NotImplementedError
 
     @classmethod
     def _object_id(cls, source: Any) -> PersistableId:
         # source is either the id fields, as a dict, or an instance of id_type
-        adapter = cls.__id_adapter()
+        adapter = type_adapter(cls.id_type())
         id_value = adapter.validate_python(source)
         values = adapter.dump_python(
             id_value, mode="json", context={_ID_ONLY: id_value}

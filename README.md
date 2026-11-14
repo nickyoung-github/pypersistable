@@ -7,8 +7,8 @@ Any type that `pydantic.TypeAdapter` can handle (dataclasses, pydantic models et
 Objects are persisted as JSON or Parquet (with some caveats, see [Parquet](#parquet)). It could likely be extended
 to handle `attrs`, [msgspec](https://pypi.org/project/msgspec) etc quite easily.
 
-There are some components, such as [DiscriminatedUnion](#discriminatedunion) and [persistable_arrow_converter](#parquet
-which can be used standalone. These may be moved out to separate packages in future.
+There are some components, such as [DiscriminatedUnion](#discriminatedunion), [ArrowConverter](#parquet)
+and [ValidatingDataclassMeta](#validating-dataclasses), which can be used standalone. These may be moved out to separate packages in future.
 
 ## Defining persistable objects
 
@@ -121,8 +121,10 @@ Animals = DiscriminatedUnion[TypeRegistry().types_for_root(Path("Animals"))]
 `ObjectStore` is an abstract base class for implementing an object store, such as a database.
 A file system-based store, `FSStore`, is provided. Objects are written into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
-Each write creates a new file per type, named by the timestamp of the write, which corresponds to
-`entry_time` in the persisted record's metadata, and a unique suffix, as concurrent writers may share a timestamp.
+Each write creates a new file per type, named by the timestamp of the write, which corresponds to the persisted
+records' `entry_time`, and a unique suffix, as concurrent writers may share a timestamp. Each record holds the
+object's `object_id`, its `effective_time` and `entry_time`, the `host` and `user` which wrote it, whether it is
+`active` (not deleted), and the object itself, as `data`.
 
 Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.
@@ -136,7 +138,8 @@ A nightly job to compact the timestamped files into a single file will improve r
 ```python
 from pypersistable import FSStore, RecordFormat
 
-store = FSStore("file:///users/hades/ObjectStore", record_format=RecordFormat.Parquet)  # Parquet is the default
+# Parquet is the default
+store = FSStore("file:///users/hades/ObjectStore", record_format=RecordFormat.Parquet)
 best_boy = Dog(name="Cerberus")
 best_boy.write(store)
 ```
@@ -234,7 +237,8 @@ as does writing an object which references it.
 best_boy.del_(store)
 Dog.read(store, name="Cerberus")  # Raises UnknownObjectError
 best_boy.write(store)  # Restored
-Dog.delete(store, name="Cerberus")  # Reads it, then deletes it: raises UnknownObjectError if not found
+# Reads it, then deletes it: raises UnknownObjectError if not found
+Dog.delete(store, name="Cerberus")
 ```
 
 Deleting is checked for conflicts as writing is, and objects not persisted, or already deleted, are ignored.
@@ -245,11 +249,16 @@ Each record has an `effective_time`, when it takes effect, and an `entry_time`, 
 methods to read the latest version as of those times:
 
 ```python
-Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))  # As we knew it on 1 January
+# As we knew it on 1 January
+Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UTC))
 ```
 
 An object read as of an earlier `entry_time` is out of date if it has since been rewritten, so writing it back
 raises a `WriteConflictError` (see [Overwriting](#overwriting)).
+
+An object can also specify an `entry_time` while being written. This allows you to update an object as of a a given
+time but still allow you to see what would have been observed at the original time of writing, for example, if you
+wish to back-date a change to an order.
 
 ### Schema evolution
 Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
@@ -265,6 +274,10 @@ the new schema.
 
 As it reads one object per schema, it may miss incompatibilities in fields which happen to be empty (e.g. `None`) in
 that object. Validation of JSON is lax, so some type changes, e.g. from `int` to `float`, are compatible.
+
+Reading objects with a type whose schema has changed incompatibly, before any write has checked it, raises too: for
+Parquet an `IncompatibleSchemaError`, naming the changed fields of the file, and for JSON pydantic's
+`ValidationError`.
 
 ### JSON
 Records are written as a JSON array. `bytes` are base64-encoded.
@@ -313,3 +326,39 @@ store = FSStore("file:///users/hades/ObjectStore", arrow_converter=converter)
 ```
 
 Note this covers the Parquet schema only: pydantic must also be able to validate and serialise the type.
+
+## Validating dataclasses
+>`ValidatingDataclassMeta` can be used independently of the `Persistable` framework
+
+`ValidatingDataclassMeta` validates each value assigned to a field of a dataclass, with pydantic in strict mode: in
+`__init__` (including defaults and `__post_init__`) and on any subsequent setting of fields.
+
+```python
+from dataclasses import dataclass, field
+
+from pypersistable import ValidatingDataclassMeta
+
+
+@dataclass(slots=True)
+class Hound(metaclass=ValidatingDataclassMeta):
+    name: str
+    heads: int = 1
+    tricks: list[str] = field(default_factory=list)
+
+
+hound = Hound(name="Cerberus", heads=3)
+hound.heads = "3"  # Raises pydantic.ValidationError: strict, so not coerced
+```
+
+- Dataclasses with or without slots, frozen dataclasses and subclasses are supported
+- Field types are resolved on first assignment, so may refer to classes defined later, and `Annotated` constraints
+  (e.g. `annotated_types.Gt`) apply
+- The value pydantic returns post validation is the one stored: e.g. a copy of an assigned list
+- Validation by the descriptors is disabled when dataclass instances are being constructed by pydantic validation,
+  e.g. while reading persistable objects or calling `TypeAdapter(MyDataclass).validate_python(...)`, as pydantic has
+  validated the fields already. Assignments in `__post_init__` are still validated, but instances constructed
+  normally by custom pydantic validators are not
+- `ClassVar` and `InitVar` fields, and fields whose class attribute is a data descriptor (e.g. a property), are not
+  validated
+- Without slots, the default of an `init=False` field that is never assigned is not validated
+- Combining with another metaclass (e.g. `ABCMeta`) requires one derived from both

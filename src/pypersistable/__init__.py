@@ -1,4 +1,5 @@
 from .arrow import ArrowConverter, UnsupportedTypeError
+from .dataclass_validation import ValidatingDataclassMeta
 from .discriminated_union import DiscriminatedUnion
 from .fs_store import FSStore, IncompatibleSchemaError, persistable_arrow_converter
 from .object_store import UnknownObjectError, WriteConflictError
@@ -25,6 +26,7 @@ __all__ = (
     "UnknownObjectError",
     "UnregisteredTypeError",
     "UnsupportedTypeError",
+    "ValidatingDataclassMeta",
     "WriteConflictError",
     "persistable_arrow_converter",
 )

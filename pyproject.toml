@@ -47,5 +47,20 @@ version_file = "src/pypersistable/_version.py"
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.7.0",
+    "pyright>=1.1.414",
     "ruff>=0.17.5",
 ]
+
+[tool.pyright]
+include = ["src", "tests", "examples"]
+
+[tool.coverage.run]
+source = ["pypersistable"]
+branch = true
+omit = ["*/_version.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 97
