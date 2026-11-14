@@ -308,6 +308,32 @@ def test_changed_object_is_rewritten(store, spy):
     assert spy["writes"][-1] == {"Deal": 1, "Counterparty": 1}
 
 
+def test_concurrent_async_reads(store):
+    counterparties = [Counterparty(name=f"C{i}") for i in range(10)]
+    store.write(counterparties)
+    now = dt.datetime.now(dt.UTC)
+    # Different times: not batched, so one store read each, run concurrently
+    reads = [
+        Counterparty.read(
+            store,
+            name=c.name,
+            entry_time=now + dt.timedelta(microseconds=i),
+            is_async=True,
+        )
+        for i, c in enumerate(counterparties)
+    ]
+    assert store.read_all(*reads) == counterparties
+
+
+def test_user_unknown(store, monkeypatch):
+    def no_user():
+        raise OSError("No username set in the environment")
+
+    monkeypatch.setattr("getpass.getuser", no_user)
+    Node(name="a").write(store)
+    assert Node.read(store, name="a") == Node(name="a")
+
+
 def test_references_resolved_in_one_read_per_level(store, spy):
     deals = shared_deals(10)
     store.write(deals)

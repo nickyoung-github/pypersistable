@@ -39,6 +39,13 @@ class RecordFormat(Enum):
     Parquet = auto()
 
 
+def _user() -> str:
+    try:
+        return getpass.getuser()
+    except OSError:  # E.g. in a container, running as a uid with no name
+        return "unknown"
+
+
 class PersistableStore(ObjectStore):
     def __init__(
         self,
@@ -166,7 +173,7 @@ class PersistableStore(ObjectStore):
             else entry_time,
             entry_time=entry_time,
             host=socket.gethostname(),
-            user=getpass.getuser(),
+            user=_user(),
         )
 
         # Serialise the objects and, if by_reference, those they reference, collected as each is serialised

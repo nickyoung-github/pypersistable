@@ -236,62 +236,66 @@ class FSStore(PersistableStore):
                 for f in ("effective_time", "entry_time")
             )
 
-        for typ, object_ids in by_type.items():
-            files = f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
-            source = (
-                "read_parquet(?, union_by_name = true, filename = true)"
-                if parquet
-                else "read_json_objects(?, format = 'array')"
-            )
-
-            try:
-                relation = self.__conn.sql(
-                    f"""
-                    SELECT {select}
-                    FROM {source}
-                    WHERE {object_id} IN (SELECT unnest(?))
-                    AND {effective} <= ?
-                    AND {entry} <= ?
-                    QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
-                    """,
-                    params=[
-                        self.__duckdb_path(files),
-                        [str(i) for i in object_ids],
-                        effective_time,
-                        entry_time,
-                    ],
+        # A cursor per read, as reads may run concurrently (see ReadBatch), which a connection does not support
+        with self.__conn.cursor() as conn:
+            for typ, object_ids in by_type.items():
+                files = (
+                    f"{self.__directory(typ)!s}/**/*.{'parquet' if parquet else 'json'}"
                 )
-            except duckdb.IOException:
-                if self.__fs.glob(files):
-                    raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
-                continue
-
-            if parquet:
-                # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own
-                # time zone
-                schema = self.__arrow.arrow_schema(self.record_type(typ))
-                table = relation.to_arrow_table()
-                records = (
-                    table.select(schema.names)
-                    .cast(schema)
-                    .to_pylist(maps_as_pydicts="strict")
+                source = (
+                    "read_parquet(?, union_by_name = true, filename = true)"
+                    if parquet
+                    else "read_json_objects(?, format = 'array')"
                 )
-                filenames = table["filename"].to_pylist()
-                record_type = pa.struct(schema)
-                results[typ] = [
-                    _drop_absent(r, record_type, self.__file_type(f))
-                    for r, f in zip(records, filenames, strict=True)
-                ]
 
-                for f in set(filenames) - self.__checked_files:
-                    self.__checked_files.add(f)
-                    if ignored := self.__differences(typ, f)[1]:
-                        warnings.warn(
-                            f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
-                            stacklevel=2,
-                        )
-            else:
-                results[typ] = [row for (row,) in relation.fetchall()]
+                try:
+                    relation = conn.sql(
+                        f"""
+                        SELECT {select}
+                        FROM {source}
+                        WHERE {object_id} IN (SELECT unnest(?))
+                        AND {effective} <= ?
+                        AND {entry} <= ?
+                        QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
+                        """,
+                        params=[
+                            self.__duckdb_path(files),
+                            [str(i) for i in object_ids],
+                            effective_time,
+                            entry_time,
+                        ],
+                    )
+                except duckdb.IOException:
+                    if self.__fs.glob(files):
+                        raise  # Not because nothing of this type has been persisted, e.g. a file could not be opened
+                    continue
+
+                if parquet:
+                    # Cast to the schema written: duckdb returns e.g. durations as integers and timestamps in its own
+                    # time zone
+                    schema = self.__arrow.arrow_schema(self.record_type(typ))
+                    table = relation.to_arrow_table()
+                    records = (
+                        table.select(schema.names)
+                        .cast(schema)
+                        .to_pylist(maps_as_pydicts="strict")
+                    )
+                    filenames = table["filename"].to_pylist()
+                    record_type = pa.struct(schema)
+                    results[typ] = [
+                        _drop_absent(r, record_type, self.__file_type(f))
+                        for r, f in zip(records, filenames, strict=True)
+                    ]
+
+                    for f in set(filenames) - self.__checked_files:
+                        self.__checked_files.add(f)
+                        if ignored := self.__differences(typ, f)[1]:
+                            warnings.warn(
+                                f"{f}: ignoring {', '.join(ignored)}, removed from {typ.__qualname__}",
+                                stacklevel=2,
+                            )
+                else:
+                    results[typ] = [row for (row,) in relation.fetchall()]
 
         return results
 
