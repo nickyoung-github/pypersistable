@@ -121,8 +121,10 @@ Animals = DiscriminatedUnion[TypeRegistry().types_for_root(Path("Animals"))]
 `ObjectStore` is an abstract base class for implementing an object store, such as a database.
 A file system-based store, `FSStore`, is provided. Objects are written into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
-Each write creates a new file per type, named by the timestamp of the write, which corresponds to
-`entry_time` in the persisted record's metadata, and a unique suffix, as concurrent writers may share a timestamp.
+Each write creates a new file per type, named by the timestamp of the write, which corresponds to the persisted
+records' `entry_time`, and a unique suffix, as concurrent writers may share a timestamp. Each record holds the
+object's `object_id`, its `effective_time` and `entry_time`, the `host` and `user` which wrote it, whether it is
+`active` (not deleted), and the object itself, as `data`.
 
 Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.

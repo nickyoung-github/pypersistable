@@ -22,22 +22,24 @@ from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolve
 from .typed_cache import type_adapter
 
 
-@dataclass
-class MetaData:
+@dataclass(kw_only=True)
+class ObjectRecord:
+    """A persisted version of an object. Stores derive the record type of each Persistable type, holding its data"""
+
+    object_id: str
     effective_time: dt.datetime
     entry_time: dt.datetime
     host: str
     user: str
+    # False once deleted. Records persisted before it was added are active
+    active: bool = True
 
 
-@dataclass
-class ObjectRecord[T]:  # There is a reason for this
-    object_id: str
-    metadata: MetaData
-    data: T
-    active: bool = (
-        True  # False once deleted. Records persisted before it was added are active
-    )
+@dataclass(kw_only=True)
+class _DataRecord(ObjectRecord):
+    """A record holding its object whole, as data: see PersistableStore.record_type"""
+
+    data: Any
 
 
 class RecordFormat(Enum):
@@ -93,11 +95,12 @@ class PersistableStore(ObjectStore):
 
     @classmethod
     @cache
-    def record_type(cls, typ: type[Persistable]) -> type[ObjectRecord]:
+    def record_type(cls, typ: type[Persistable]) -> type[_DataRecord]:
         return make_dataclass(
             f"{typ.__qualname__}Record",
             [("data", typ)],
-            bases=(ObjectRecord,),
+            bases=(_DataRecord,),
+            kw_only=True,
             # base64 in JSON, as bytes need not be valid UTF-8 (pydantic's default)
             namespace={
                 "__pydantic_config__": ConfigDict(
@@ -116,7 +119,7 @@ class PersistableStore(ObjectStore):
 
     def _validate(
         self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
-    ) -> ObjectRecord:
+    ) -> _DataRecord:
         """A result of _read, validated as a record of typ"""
         adapter = type_adapter(self.record_type(typ))
         validate = (
@@ -144,12 +147,12 @@ class PersistableStore(ObjectStore):
         effective_time: dt.datetime,
         entry_time: dt.datetime,
         resolver: ReferenceResolver,
-    ) -> dict[PersistableId, ObjectRecord]:
+    ) -> dict[PersistableId, _DataRecord]:
         by_type: dict[type[Persistable], set[PersistableId]] = {}
         for object_id in object_ids:
             by_type.setdefault(object_id.typ, set()).add(object_id)
 
-        ret: dict[PersistableId, ObjectRecord] = {}
+        ret: dict[PersistableId, _DataRecord] = {}
         unresolved = []  # Records with references, to validate again once those are loaded
 
         for typ, results in self._read(by_type, effective_time, entry_time).items():
@@ -182,13 +185,13 @@ class PersistableStore(ObjectStore):
         return ret
 
     @staticmethod
-    def __loaded(record: ObjectRecord) -> ObjectRecord:
-        record.data._set_object_entry_time(record.metadata.entry_time)
+    def __loaded(record: _DataRecord) -> _DataRecord:
+        record.data._set_object_entry_time(record.entry_time)
         return record
 
     def __current(
         self, object_ids: Iterable[PersistableId]
-    ) -> dict[PersistableId, ObjectRecord]:
+    ) -> dict[PersistableId, _DataRecord]:
         # The latest records, including deleted ones. References are left as ids, which is all comparing records
         # needs: one read, rather than one per level
         return self.__read(
@@ -199,30 +202,28 @@ class PersistableStore(ObjectStore):
         )
 
     @staticmethod
-    def __metadata(effective_time: dt.datetime) -> MetaData:
+    def __metadata(effective_time: dt.datetime) -> dict[str, Any]:
+        """The ObjectRecord fields, other than object_id and active, of the records of a write"""
         entry_time = dt.datetime.now(dt.UTC)
-        return MetaData(
-            effective_time=effective_time
+        return {
+            "effective_time": effective_time
             if effective_time != dt.datetime.max
             else entry_time,
-            entry_time=entry_time,
-            host=socket.gethostname(),
-            user=_user(),
-        )
+            "entry_time": entry_time,
+            "host": socket.gethostname(),
+            "user": _user(),
+        }
 
     def __dump(
         self,
         object_id: PersistableId,
         obj: Persistable,
-        metadata: MetaData,
+        metadata: dict[str, Any],
         context: dict[str, Any],
         active: bool = True,
     ) -> dict[str, Any]:
         record = self.record_type(type(obj))(
-            object_id=str(object_id),
-            metadata=metadata,
-            data=obj,  # pyright: ignore[reportCallIssue]
-            active=active,
+            object_id=str(object_id), data=obj, active=active, **metadata
         )
         parquet = self.__record_format is RecordFormat.Parquet
         return type_adapter(self.record_type(type(obj))).dump_python(
@@ -233,7 +234,7 @@ class PersistableStore(ObjectStore):
         self, object_id: PersistableId, obj: Persistable, stored: ObjectRecord
     ) -> str | None:
         # Why writing obj over the persisted version, stored, would be a conflict, if it would
-        version, latest = obj.object_entry_time, stored.metadata.entry_time
+        version, latest = obj.object_entry_time, stored.entry_time
         if version is None:
             # A deleted object may be restored without having been read
             if stored.active and self.__require_load_of_existing:
@@ -263,6 +264,7 @@ class PersistableStore(ObjectStore):
             )
 
         metadata = self.__metadata(effective_time)
+        entry_time: dt.datetime = metadata["entry_time"]
 
         # Serialise the objects and, if by_reference, those they reference, collected as each is serialised
         collector = ReferenceCollector()
@@ -313,7 +315,7 @@ class PersistableStore(ObjectStore):
                 == records[i]["data"]
             ):
                 del records[i]
-                versions[i] = stored.metadata.entry_time
+                versions[i] = stored.entry_time
             elif conflict := self.__conflict(i, objs[i], stored):
                 conflicts.append(conflict)
 
@@ -324,9 +326,9 @@ class PersistableStore(ObjectStore):
             by_type.setdefault(object_id.typ, []).append(record)
 
         if by_type:
-            self._write(by_type, metadata.entry_time)
+            self._write(by_type, entry_time)
 
-        versions.update(dict.fromkeys(records, metadata.entry_time))
+        versions.update(dict.fromkeys(records, entry_time))
         for object_id, version in versions.items():
             objs[object_id]._set_object_entry_time(version)
 
@@ -351,6 +353,7 @@ class PersistableStore(ObjectStore):
 
         # The persisted data, not the objects', which may have been changed
         metadata = self.__metadata(effective_time)
+        entry_time: dt.datetime = metadata["entry_time"]
         context = {STRUCT_LAYOUT: self.__record_format is RecordFormat.Parquet}
         by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
         for object_id, stored in current.items():
@@ -359,9 +362,9 @@ class PersistableStore(ObjectStore):
             )
 
         if by_type:
-            self._write(by_type, metadata.entry_time)
+            self._write(by_type, entry_time)
             for object_id in current:
-                objs[object_id]._set_object_entry_time(metadata.entry_time)
+                objs[object_id]._set_object_entry_time(entry_time)
 
     @staticmethod
     def read_all(

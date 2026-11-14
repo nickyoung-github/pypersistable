@@ -241,14 +241,12 @@ class FSStore(PersistableStore):
                 "*",
                 "read_parquet(?, union_by_name = true, filename = true)",
             )
-            columns = {"object_id": "object_id"} | {
-                f: f"metadata.{f}" for f in ("effective_time", "entry_time")
-            }
+            columns = {f: f for f in ("object_id", "effective_time", "entry_time")}
         else:
             # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
             select, source = "json", "read_json_objects(?, format = 'array')"
             columns = {"object_id": "json->>'$.object_id'"} | {
-                f: f"(json->>'$.metadata.{f}')::TIMESTAMPTZ"
+                f: f"(json->>'$.{f}')::TIMESTAMPTZ"
                 for f in ("effective_time", "entry_time")
             }
 
