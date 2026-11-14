@@ -2,6 +2,7 @@ import asyncio
 import datetime as dt
 from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, make_dataclass
+from enum import Enum, auto
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -70,13 +71,26 @@ class ObjectRecord[T]:  # There is a reason for this
     data: T
 
 
+class RecordFormat(Enum):
+    Json = auto()
+    Parquet = auto()
+
+
 class PersistableStore(ObjectStore):
+    def __init__(self, record_format: RecordFormat):
+        self.__record_format = record_format
+
+    @property
+    def record_format(self) -> RecordFormat:
+        return self.__record_format
+
     def _read(
         self,
         by_directory: dict[Path, list[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
-    ) -> dict[Path, list[dict[str, Any]]]: ...
+    ) -> dict[Path, list[dict[str, Any]] | list[str]]:
+        """Records for the requested ids, by directory: raw JSON strings for RecordFormat.Json, else python objects"""
 
     def _write(self, records_by_path: dict[Path, list[dict[str, Any]]]): ...
 
@@ -127,16 +141,22 @@ class PersistableStore(ObjectStore):
             if not results:
                 continue
 
-            typ = PersistableId.parse(results[0]["object_id"]).typ
-            type_adaptor = self.type_adaptor(self.record_type(typ))
+            type_adaptor = self.type_adaptor(
+                self.record_type(by_directory[directory][0].typ)
+            )
+            validate = (
+                type_adaptor.validate_json
+                if self.__record_format is RecordFormat.Json
+                else type_adaptor.validate_python
+            )
 
             for result in results:
                 resolver = ReferenceResolver(self)
                 context = {"resolver": resolver}
-                record = type_adaptor.validate_python(result, context=context)
+                record = validate(result, context=context)
 
                 if resolver.resolve():
-                    record = type_adaptor.validate_python(result, context=context)
+                    record = validate(result, context=context)
 
                 object_id = PersistableId.parse(record.object_id)
                 resolver_cache[object_id] = ret[object_id] = record.data
@@ -189,7 +209,11 @@ class PersistableStore(ObjectStore):
             )
             resolver = ReferenceResolver(self)
             context = {"resolver": resolver} if by_reference else None
-            data = type_adapter.dump_python(record, context=context)
+            data = type_adapter.dump_python(
+                record,
+                mode="json" if self.__record_format is RecordFormat.Json else "python",
+                context=context,
+            )
 
             objects.extend(resolver.take_pending_writes())
             by_path.setdefault(path, []).append(data)

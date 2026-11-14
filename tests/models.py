@@ -1,9 +1,11 @@
 from collections.abc import Iterable
 from dataclasses import InitVar, dataclass
+from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from pypersistable import (
+    DiscriminatedUnion,
     Identifiable,
     IdField,
     ObjectStore,
@@ -79,6 +81,24 @@ class Scaled(Identifiable):
         self.value *= scale
 
 
+class Dog(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bark: str
+
+
+@dataclass(frozen=True)
+class Cat:
+    lives: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class Kennel(Identifiable):
+    name: IdField[str]
+    pet: DiscriminatedUnion[Dog, Cat]  # pyright: ignore[reportInvalidTypeForm]
+    fee: Decimal = Decimal(0)
+    tags: tuple[str, ...] = ()
+
+
 for _typ in (
     Counterparty,
     TradingBook,
@@ -91,6 +111,7 @@ for _typ in (
     ModelBook,
     Pair,
     Scaled,
+    Kennel,
 ):
     registry.register(_typ.__name__, _typ)
 

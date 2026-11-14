@@ -2,9 +2,9 @@ from dataclasses import dataclass  # noqa: N999
 
 from pypersistable import (
     FSStore,
-    FSStoreFormat,
     Identifiable,
     IdField,
+    RecordFormat,
     Reference,
     TypeRegistry,
 )
@@ -35,7 +35,7 @@ ctpy = Counterparty(name="Acme", location="NW3", contact_name="Nick")
 book = CustomerBook(counterparty=ctpy, sales_coverage=("Tweedledum", "Tweedledee"))
 root = r"file:///Users/Nick/ObjectStore"
 
-for store_format in (FSStoreFormat.Json, FSStoreFormat.Parquet):
+for store_format in (RecordFormat.Json, RecordFormat.Parquet):
     store = FSStore(f"{root}/{store_format.name.lower()}", record_format=store_format)
     # This will cause both book and ctpy (because it is a reference) to be written
     book.write(store)

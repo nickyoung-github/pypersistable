@@ -1,5 +1,4 @@
 import datetime as dt
-from enum import Enum, auto
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -13,19 +12,14 @@ from orjson import dumps
 
 from ._anyschema import PIPELINE
 from .persistable_id import PersistableId
-from .persistable_store import ObjectRecord, PersistableStore
-
-
-class FSStoreFormat(Enum):
-    Json = auto()
-    Parquet = auto()
+from .persistable_store import ObjectRecord, PersistableStore, RecordFormat
 
 
 class FSStore(PersistableStore):
-    def __init__(self, url: str, record_format: FSStoreFormat = FSStoreFormat.Parquet):
+    def __init__(self, url: str, record_format: RecordFormat = RecordFormat.Parquet):
+        super().__init__(record_format)
         self.__fs, root = url_to_fs(url)
         self.__root = Path(root)
-        self.__record_format = record_format
         self.__conn = duckdb.connect()
         self.__conn.register_filesystem(self.__fs)
 
@@ -40,38 +34,55 @@ class FSStore(PersistableStore):
         by_directory: dict[Path, list[PersistableId]],
         effective_time: dt.datetime,
         entry_time: dt.datetime,
-    ) -> dict[Path, list[dict[str, Any]]]:
+    ) -> dict[Path, list[dict[str, Any]] | list[str]]:
         results = {}
+        parquet = self.record_format is RecordFormat.Parquet
+
+        if parquet:
+            select, object_id, effective, entry = (
+                "*",
+                "object_id",
+                "metadata.effective_time",
+                "metadata.entry_time",
+            )
+        else:
+            # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
+            select = "json"
+            object_id = "json->>'$.object_id'"
+            effective, entry = (
+                f"(json->>'$.metadata.{f}')::TIMESTAMPTZ"
+                for f in ("effective_time", "entry_time")
+            )
 
         for directory, object_ids in by_directory.items():
-            resolved_directory = self.__root.joinpath(directory)
-            from_spec = (
-                f"""
-            FROM read_parquet('{resolved_directory!s}/**/*.parquet', union_by_name = true)
-            """
-                if self.__record_format is FSStoreFormat.Parquet
-                else f"""
-            FROM read_json('{resolved_directory!s}/**/*.json', union_by_name = true)
-            """
+            files = f"{self.__root.joinpath(directory)!s}/**/*"
+            source = (
+                f"read_parquet('{files}.parquet', union_by_name = true)"
+                if parquet
+                else f"read_json_objects('{files}.json', format = 'array')"
             )
 
             try:
-                table = self.__conn.sql(
+                relation = self.__conn.sql(
                     f"""
-                    SELECT *
-                    {from_spec}
-                    WHERE object_id IN (SELECT unnest(?))
-                    AND metadata.effective_time <= ?
-                    AND metadata.entry_time <= ?
-                    QUALIFY row_number() OVER (PARTITION BY object_id ORDER BY metadata.entry_time DESC) = 1
+                    SELECT {select}
+                    FROM {source}
+                    WHERE {object_id} IN (SELECT unnest(?))
+                    AND {effective} <= ?
+                    AND {entry} <= ?
+                    QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry} DESC) = 1
                     """,
                     params=[[str(i) for i in object_ids], effective_time, entry_time],
-                ).to_arrow_table()
-
-                results[directory] = table.to_pylist()
+                )
             except duckdb.IOException:
                 # This will happen if no objects of this type have been saved
-                pass
+                continue
+
+            results[directory] = (
+                relation.to_arrow_table().to_pylist()
+                if parquet
+                else [row for (row,) in relation.fetchall()]
+            )
 
         return results
 
@@ -85,15 +96,15 @@ class FSStore(PersistableStore):
 
             self.__fs.makedirs(path.parent, exist_ok=True)
 
-            match self.__record_format:
-                case FSStoreFormat.Parquet:
+            match self.record_format:
+                case RecordFormat.Parquet:
                     schema = self.__schema(self.record_type(typ))
                     table = pa.Table.from_pylist(records, schema=schema)
                     with pq.ParquetWriter(
-                        str(path.with_suffix(".parquet")), schema, filesystem=self.__fs
+                        f"{path}.parquet", schema, filesystem=self.__fs
                     ) as writer:
                         writer.write_table(table)
-                case FSStoreFormat.Json:
-                    self.__fs.write_bytes(path.with_suffix(".json"), dumps(records))
+                case RecordFormat.Json:
+                    self.__fs.write_bytes(f"{path}.json", dumps(records))
                 case _:
-                    raise RuntimeError(f"Unsupported format {self.__record_format}")
+                    raise RuntimeError(f"Unsupported format {self.record_format}")
