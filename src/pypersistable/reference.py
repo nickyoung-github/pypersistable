@@ -95,8 +95,10 @@ class _Reference:
 
             resolver: ReferenceResolver | None = (info.context or {}).get(RESOLVER)
             if resolver is None:
-                raise RuntimeError(
-                    f"Need a context containing {{{RESOLVER!r}: ReferenceResolver}} to resolve references"
+                # A ValueError, so that pydantic raises a ValidationError
+                raise ValueError(
+                    f"{value!r} is a persisted reference: resolving it needs a context containing "
+                    f"{{{RESOLVER!r}: ReferenceResolver}}"
                 )
 
             # A persisted reference: not validated as source_type, as it may resolve to its id for now

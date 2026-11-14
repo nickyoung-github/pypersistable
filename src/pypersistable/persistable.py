@@ -1,5 +1,4 @@
 import datetime as dt
-from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from contextvars import ContextVar
 from dataclasses import InitVar, fields, make_dataclass
@@ -45,7 +44,7 @@ _ID_ONLY = "id_only"
 _COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", default=())
 
 
-class Persistable(ABC):
+class Persistable:
     __object_entry_time = None  # Not annotated, so that it is not a field
 
     def __hash__(self):
@@ -84,10 +83,10 @@ class Persistable(ABC):
         }  # pyright: ignore[reportReturnType]
 
     @classmethod
-    @abstractmethod
     def id_type(cls) -> type:
         """The type identifying objects of this class: a generated dataclass of the id fields
         for an `Identifiable`, the class itself for a `Unique`."""
+        raise NotImplementedError
 
     @classmethod
     @cache

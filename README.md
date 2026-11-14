@@ -7,8 +7,8 @@ Any type that `pydantic.TypeAdapter` can handle (dataclasses, pydantic models et
 Objects are persisted as JSON or Parquet (with some caveats, see [Parquet](#parquet)). It could likely be extended
 to handle `attrs`, [msgspec](https://pypi.org/project/msgspec) etc quite easily.
 
-There are some components, such as [DiscriminatedUnion](#discriminatedunion) and [persistable_arrow_converter](#parquet
-which can be used standalone. These may be moved out to separate packages in future.
+There are some components, such as [DiscriminatedUnion](#discriminatedunion), [ArrowConverter](#parquet)
+and [ValidatingDataclassMeta](#validating-dataclasses), which can be used standalone. These may be moved out to separate packages in future.
 
 ## Defining persistable objects
 
@@ -251,6 +251,10 @@ Dog.read(store, name="Cerberus", entry_time=dt.datetime(2026, 1, 1, tzinfo=dt.UT
 An object read as of an earlier `entry_time` is out of date if it has since been rewritten, so writing it back
 raises a `WriteConflictError` (see [Overwriting](#overwriting)).
 
+An object can also specify an `entry_time` while being written. This allows you to update an object as of a a given
+time but still allow you to see what would have been observed at the original time of writing, for example, if you
+wish to back-date a change to an order.
+
 ### Schema evolution
 Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
 Changing a field's type is not supported, nor is removing (or renaming) a field of a type which forbids extra fields
@@ -313,3 +317,40 @@ store = FSStore("file:///users/hades/ObjectStore", arrow_converter=converter)
 ```
 
 Note this covers the Parquet schema only: pydantic must also be able to validate and serialise the type.
+
+## Validating dataclasses
+>`ValidatingDataclassMeta` can be used independently of the `Persistable` framework
+
+`ValidatingDataclassMeta` validates each value assigned to a field of a dataclass, with pydantic in strict mode: in
+`__init__` (including defaults and `__post_init__`) and on any subsequent setting of fields.
+
+```python
+from dataclasses import dataclass, field
+
+from pypersistable import ValidatingDataclassMeta
+
+
+@dataclass(slots=True)
+class Hound(metaclass=ValidatingDataclassMeta):
+    name: str
+    heads: int = 1
+    tricks: list[str] = field(default_factory=list)
+
+
+hound = Hound(name="Cerberus", heads=3)
+hound.heads = "3"  # Raises pydantic.ValidationError: strict, so not coerced
+```
+
+- Dataclasses with or without slots, frozen dataclasses and subclasses are supported
+- Field types are resolved on first assignment, so may refer to classes defined later, and `Annotated` constraints
+  (e.g. `annotated_types.Gt`) apply
+- The value pydantic returns post validation is the one stored: e.g. a copy of an assigned list
+- Validation by the descriptors is disabled when dataclass instances are being constructed by pydantic validation,
+  e.g. while reading persistable objects or calling `TypeAdapter(MyDataclass).validate_python(...)`, as pydantic has
+  validated the fields already. Assignments in `__post_init__` are still validated, but instances constructed
+  normally by custom pydantic validators are not
+- `ClassVar` and `InitVar` fields, and fields whose class attribute is a data descriptor (e.g. a property), are not
+  validated
+- Without slots, a field's class attribute is the validating descriptor, not its default, and the default of an
+  `init=False` field, never assigned, is not validated
+- Combining with another metaclass (e.g. `ABCMeta`) requires one derived from both
