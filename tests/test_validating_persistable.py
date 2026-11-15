@@ -8,10 +8,8 @@ from models import registry
 from pydantic import ValidationError
 
 from pypersistable import (
-    FSStore,
     Identifiable,
     IdField,
-    RecordFormat,
     Reference,
     Unique,
     UnknownObjectError,
@@ -59,11 +57,6 @@ class VUnique(Unique, metaclass=ValidatingDataclassMeta):
 
 for _typ in (VLeaf, VBranch, VSlotsLeaf, VSlotsBranch, VById, VUnique):
     registry.register(_typ.__name__, _typ)
-
-
-@pytest.fixture(params=list(RecordFormat), ids=lambda f: f.name)
-def store(request, tmp_path) -> FSStore:
-    return FSStore(f"file://{tmp_path}", record_format=request.param)
 
 
 @pytest.fixture(

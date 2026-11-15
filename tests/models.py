@@ -8,7 +8,7 @@ from pypersistable import (
     DiscriminatedUnion,
     Identifiable,
     IdField,
-    ObjectStore,
+    PersistableStore,
     Reference,
     TypeRegistry,
     Unique,
@@ -142,6 +142,32 @@ class NoIds(Identifiable):
     other: "NoIds | None" = None  # A forward reference, deferring the id field check
 
 
+# Schema evolution: each type is another version of the one before, as if its code had been changed
+
+
+@dataclass
+class Evolving(Identifiable):
+    name: IdField[str]
+    added: int = 7  # Added after the first version was written
+
+
+@dataclass
+class EvolvingBefore(Identifiable):
+    name: IdField[str]
+
+
+@dataclass
+class EvolvingRetyped(Identifiable):
+    name: IdField[str]
+    added: str = "7"
+
+
+@dataclass
+class EvolvingNoDefault(Identifiable):
+    name: IdField[str]
+    added: int
+
+
 for _typ in (
     Counterparty,
     TradingBook,
@@ -161,11 +187,15 @@ for _typ in (
     Node,
     IdNode,
     HoldsIdNode,
+    Evolving,
+    EvolvingBefore,
+    EvolvingRetyped,
+    EvolvingNoDefault,
 ):
     registry.register(_typ.__name__, _typ)
 
 
-class DictStore(ObjectStore):
+class DictStore(PersistableStore):
     """In-memory store recording each batch of ids it is asked to read."""
 
     def __init__(self, *objects):

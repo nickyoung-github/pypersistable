@@ -31,8 +31,15 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
+    "alembic>=1.13",
+    "psycopg[binary]>=3",
     "pytest",
-    "pytest-cov"
+    "pytest-cov",
+    "sqlalchemy>=2",
+]
+sql = [
+    "alembic>=1.13",
+    "sqlalchemy>=2",
 ]
 
 [project.urls]
