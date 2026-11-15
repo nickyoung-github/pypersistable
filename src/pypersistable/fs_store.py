@@ -1,6 +1,7 @@
 import datetime as dt
 import warnings
 from collections.abc import Iterator, Mapping
+from enum import Enum, auto
 from itertools import pairwise
 from pathlib import Path
 from types import NoneType, UnionType
@@ -16,12 +17,13 @@ from orjson import dumps, loads
 from pydantic import ValidationError
 
 from .arrow import ArrowConverter, UnsupportedTypeError
-from .discriminated_union import TAG_FIELD, DiscriminatedUnionInfo
+from .discriminated_union import STRUCT_LAYOUT, TAG_FIELD, DiscriminatedUnionInfo
 from .persistable import Persistable
 from .persistable_id import PersistableId
-from .persistable_store import PersistableStore, RecordFormat
-from .reference import ReferenceResolver, _Reference
+from .persistable_store_base import PersistableStoreBase, _DataRecord
+from .reference import RESOLVER, ReferenceResolver, _Reference
 from .type_registry import TypeRegistry
+from .typed_cache import type_adapter
 
 
 def persistable_arrow_converter() -> ArrowConverter:
@@ -138,11 +140,16 @@ def _unwrap(hint: Any) -> tuple[Any, tuple[Any, ...]]:
             return hint, metadata
 
 
+class RecordFormat(Enum):
+    Json = auto()
+    Parquet = auto()
+
+
 class IncompatibleSchemaError(TypeError):
     """A type's schema is incompatible with that of its persisted objects: a field was removed or its type changed"""
 
 
-class FSStore(PersistableStore):
+class FSStore(PersistableStoreBase):
     def __init__(
         self,
         url: str,
@@ -151,7 +158,8 @@ class FSStore(PersistableStore):
         require_load_of_existing: bool = False,
     ):
         """arrow_converter: for Parquet, defaults to persistable_arrow_converter()"""
-        super().__init__(record_format, require_load_of_existing)
+        super().__init__(require_load_of_existing)
+        self.__record_format = record_format
         self.__arrow = arrow_converter or _ARROW_CONVERTER
         self.__fs, root = url_to_fs(url)
         self.__root = Path(root)
@@ -164,6 +172,13 @@ class FSStore(PersistableStore):
         )  # Compatible, ignored fields warned of, when read
         # Types whose schemas have been checked, on their first write. A redefined type is checked again
         self.__checked_types: set[type[Persistable]] = set()
+
+    @property
+    def record_format(self) -> RecordFormat:
+        return self.__record_format
+
+    def __repr__(self) -> str:
+        return f"FSStore({self.__fs.unstrip_protocol(str(self.__root))!r}, {self.record_format})"
 
     def __duckdb_path(self, path: str) -> str:
         # duckdb uses the registered filesystem for paths with its protocol, and its own for local paths (faster)
@@ -241,12 +256,14 @@ class FSStore(PersistableStore):
                 "*",
                 "read_parquet(?, union_by_name = true, filename = true)",
             )
-            columns = {f: f for f in ("object_id", "effective_time", "entry_time")}
+            columns = {
+                f: f"_{f}" for f in ("object_id", "effective_time", "entry_time")
+            }
         else:
             # Raw JSON: pydantic validates it, rather than duckdb inferring (and merging) a schema across records
             select, source = "json", "read_json_objects(?, format = 'array')"
-            columns = {"object_id": "json->>'$.object_id'"} | {
-                f: f"(json->>'$.{f}')::TIMESTAMPTZ"
+            columns = {"object_id": "json->>'$._object_id'"} | {
+                f: f"(json->>'$._{f}')::TIMESTAMPTZ"
                 for f in ("effective_time", "entry_time")
             }
 
@@ -302,6 +319,7 @@ class FSStore(PersistableStore):
         effective_time: dt.datetime,
         entry_time: dt.datetime,
     ) -> dict[type[Persistable], list[dict[str, Any]] | list[str]]:
+        """Raw JSON strings for RecordFormat.Json, else python objects"""
         latest = (
             "{object_id} IN (SELECT unnest(?)) AND {effective_time} <= ? AND {entry_time} <= ? "
             "QUALIFY row_number() OVER (PARTITION BY {object_id} ORDER BY {entry_time} DESC) = 1"
@@ -317,6 +335,29 @@ class FSStore(PersistableStore):
                 )
                 for typ, ids in by_type.items()
             }
+
+    def _serialise(
+        self, record: _DataRecord, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        parquet = self.record_format is RecordFormat.Parquet
+        return type_adapter(type(record)).dump_python(
+            record,
+            mode="python" if parquet else "json",
+            context={**context, STRUCT_LAYOUT: parquet},
+        )
+
+    def _validate(
+        self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
+    ) -> _DataRecord:
+        if self.record_format is RecordFormat.Parquet:
+            return super()._validate(typ, result, resolver)
+        return type_adapter(self.record_type(typ)).validate_json(
+            result, context={RESOLVER: resolver}
+        )
+
+    @property
+    def _references_by_value(self) -> bool:
+        return self.record_format is RecordFormat.Json
 
     def _check_types(self, types: set[type[Persistable]]):
         for typ in types - self.__checked_types:
@@ -362,7 +403,9 @@ class FSStore(PersistableStore):
         self,
         by_type: dict[type[Persistable], list[dict[str, Any]]],
         entry_time: dt.datetime,
+        expected: Mapping[PersistableId, dt.datetime | None],
     ):
+        # Files are only added, so writes cannot be checked for concurrent changes: expected is ignored
         filename = _filename(entry_time)
         for typ, records in by_type.items():
             directory = self.__directory(typ)

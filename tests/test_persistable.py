@@ -29,9 +29,8 @@ from pypersistable import (
     Unique,
     UnknownObjectError,
 )
-from pypersistable.object_store import ReadBatch
 from pypersistable.persistable import Persistable
-from pypersistable.persistable_store import PersistableStore
+from pypersistable.persistable_store import PersistableStore, ReadBatch
 
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
