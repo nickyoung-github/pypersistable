@@ -1,11 +1,16 @@
 from .arrow import ArrowConverter, UnsupportedTypeError
 from .dataclass_validation import ValidatingDataclassMeta
 from .discriminated_union import DiscriminatedUnion
-from .fs_store import FSStore, IncompatibleSchemaError, persistable_arrow_converter
-from .object_store import UnknownObjectError, WriteConflictError
+from .fs_store import (
+    FSStore,
+    IncompatibleSchemaError,
+    RecordFormat,
+    persistable_arrow_converter,
+)
 from .persistable import Identifiable, IdField, Unique
 from .persistable_id import PersistableId
-from .persistable_store import ObjectStore, RecordFormat
+from .persistable_store import PersistableStore, UnknownObjectError, WriteConflictError
+from .persistable_store_base import ObjectRecord, PersistableStoreBase
 from .reference import Reference
 from .type_registry import RegistrationError, TypeRegistry, UnregisteredTypeError
 
@@ -16,8 +21,10 @@ __all__ = (
     "IdField",
     "Identifiable",
     "IncompatibleSchemaError",
-    "ObjectStore",
+    "ObjectRecord",
     "PersistableId",
+    "PersistableStore",
+    "PersistableStoreBase",
     "RecordFormat",
     "Reference",
     "RegistrationError",

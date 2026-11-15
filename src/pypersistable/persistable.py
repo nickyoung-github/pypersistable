@@ -9,6 +9,7 @@ from typing import (
     Literal,
     Self,
     TypeVar,
+    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -24,8 +25,8 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, PydanticSerializationError, core_schema
 
-from .object_store import ObjectStore, ReadBatch, UnknownObjectError
 from .persistable_id import PersistableId
+from .persistable_store import PersistableStore, ReadBatch, UnknownObjectError
 from .typed_cache import type_adapter, typed_cache
 
 
@@ -125,7 +126,7 @@ class Persistable:
     @classmethod
     def read(
         cls,
-        db: ObjectStore,
+        db: PersistableStore,
         /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
@@ -138,7 +139,7 @@ class Persistable:
     @classmethod
     def read(
         cls,
-        db: ObjectStore,
+        db: PersistableStore,
         /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
@@ -150,7 +151,7 @@ class Persistable:
     @classmethod
     def read(
         cls,
-        db: ObjectStore,
+        db: PersistableStore,
         /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
@@ -167,13 +168,14 @@ class Persistable:
         # Not within the try: a KeyError raised reading is not an unknown object
         objects = db.read([object_id], effective_time, entry_time)
         try:
-            return objects[object_id]
+            # Of cls, as its id says
+            return cast(Self, objects[object_id])
         except KeyError:
             raise UnknownObjectError(cls, kwargs, object_id) from None
 
     def write(
         self,
-        db: ObjectStore,
+        db: PersistableStore,
         effective_time: dt.datetime = dt.datetime.max,
         force_overwrite: bool = False,
         by_reference: bool = True,
@@ -188,7 +190,7 @@ class Persistable:
     @classmethod
     def delete(
         cls,
-        db: ObjectStore,
+        db: PersistableStore,
         /,
         *,
         effective_time: dt.datetime = dt.datetime.max,
@@ -200,11 +202,11 @@ class Persistable:
 
     def del_(
         self,
-        db: ObjectStore,
+        db: PersistableStore,
         effective_time: dt.datetime = dt.datetime.max,
         force_overwrite: bool = False,
     ) -> None:
-        """Marks this object deleted: see ObjectStore.delete. Writing it again restores it"""
+        """Marks this object deleted: see PersistableStore.delete. Writing it again restores it"""
         db.delete(
             [self], effective_time=effective_time, force_overwrite=force_overwrite
         )

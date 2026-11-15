@@ -11,6 +11,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.13", "3.14"]
+    # SQLStore is tested on SQLite only: set PYPERSISTABLE_TEST_POSTGRES_URL to also test it on PostgreSQL
     steps:
       - uses: actions/checkout@v4
         with:
