@@ -118,13 +118,18 @@ Animals = DiscriminatedUnion[TypeRegistry().types_for_root(Path("Animals"))]
 
 ## Storing persistable objects
 
-`ObjectStore` is an abstract base class for implementing an object store, such as a database.
-A file system-based store, `FSStore`, is provided. Objects are written into directories, formed
+`PersistableStore` is the interface of an object store, such as a database. `PersistableStoreBase` implements it
+over records, which its subclasses store and query. Each record holds the object's `_object_id`, its
+`_effective_time` and `_entry_time`, the `_host` and `_user` which wrote it, whether it is `_active` (not deleted),
+and the object itself, as `_data`. The fields are prefixed with `_` so that a store may hold them alongside the
+object's own fields.
+
+Two stores are provided: `FSStore`, below, and `SQLStore`, in a SQL database (see [SQL](#sql)).
+
+`FSStore` writes objects into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
 Each write creates a new file per type, named by the timestamp of the write, which corresponds to the persisted
-records' `entry_time`, and a unique suffix, as concurrent writers may share a timestamp. Each record holds the
-object's `object_id`, its `effective_time` and `entry_time`, the `host` and `user` which wrote it, whether it is
-`active` (not deleted), and the object itself, as `data`.
+records' `_entry_time`, and a unique suffix, as concurrent writers may share a timestamp.
 
 Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.
@@ -209,7 +214,7 @@ address = Address.read(store, street_number="1", ...)  # A Unique's id fields ar
 Unknown or missing id fields raise a pydantic `ValidationError`.
 
 To read several objects, possibly of different types, in one go, pass `is_async=True` to get coroutines and await them
-together. Reads from the same store (as of the same times) are batched into one `ObjectStore.read`:
+together. Reads from the same store (as of the same times) are batched into one `PersistableStore.read`:
 
 ```python
 best_boy, blofeld = store.read_all(
@@ -221,15 +226,15 @@ best_boy, blofeld = store.read_all(
 `read_all` runs them with `asyncio.run`, or on the `loop` you supply. Within your own async code, use e.g.
 `asyncio.gather`.
 
-`ObjectStore.read` reads by `PersistableId`, returning a dict of the objects found:
+`PersistableStore.read` reads by `PersistableId`, returning a dict of the objects found:
 
 ```python
 loaded = store.read([best_boy.object_id, blofeld.object_id])
 ```
 
 ### Deleting
-`Persistable.del_` (or `ObjectStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
-a new version of their persisted data with `active=False`. Reads no longer find them, but their data is kept: reads
+`Persistable.del_` (or `PersistableStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
+a new version of their persisted data with `_active=False`. Reads no longer find them, but their data is kept: reads
 as of earlier times still do, and references to them still resolve. Writing a deleted object again restores it,
 as does writing an object which references it.
 
@@ -244,7 +249,7 @@ Dog.delete(store, name="Cerberus")
 Deleting is checked for conflicts as writing is, and objects not persisted, or already deleted, are ignored.
 
 ### Bitemporality
-Each record has an `effective_time`, when it takes effect, and an `entry_time`, when it was written. Pass
+Each record has an `_effective_time`, when it takes effect, and an `_entry_time`, when it was written. Pass
 `effective_time` to `write` (it defaults to the entry time), and `effective_time` and/or `entry_time` to the read
 methods to read the latest version as of those times:
 
@@ -326,6 +331,37 @@ store = FSStore("file:///users/hades/ObjectStore", arrow_converter=converter)
 ```
 
 Note this covers the Parquet schema only: pydantic must also be able to validate and serialise the type.
+
+### SQL
+`SQLStore` (in `pypersistable.sql_store`: install `pypersistable[sql]`) stores objects in a SQL database, using
+SQLAlchemy, and Alembic to add columns. It is tested with SQLite and PostgreSQL.
+
+```python
+from pypersistable.sql_store import SQLStore
+from sqlalchemy import create_engine
+
+# Optionally, in a database schema of its own
+store = SQLStore(
+    create_engine("postgresql+psycopg://hades@localhost/underworld"), schema="objects"
+)
+```
+
+- Each type has a table, named by its registered name (shortened, with a hash, if too long for the database),
+  created on its first write. Its columns are the record fields (its primary key `_object_id` and `_entry_time`), a
+  column per field of the type, and `_nulls`, the fields which are `None`
+- Column types are from the fields' Arrow types, as for Parquet (also taking an `arrow_converter`), with nested
+  values (structs, collections and `DiscriminatedUnion`) as JSON (JSONB in PostgreSQL). So `by_reference=False` is
+  not supported. Fields of types with no Arrow type, e.g. unions other than `T | None`, are JSON too: giving one an
+  Arrow type later (e.g. with `add_type`) changes its column's type, which is incompatible
+- Writes are atomic: each is one transaction. A `_latest_versions` table holds each object's latest version, set by
+  compare-and-set, so that a write conflicting with a concurrent one raises `WriteConflictError` and writes nothing.
+  So does one begun before a concurrent write of its objects, even if forcing an overwrite, as its entry time is
+  earlier. Entry times are from writers' clocks, so keep them synchronised
+
+On its first write of a type, it compares the column types with the table's, raising an `IncompatibleSchemaError` if
+any has changed, reads its latest object with the type, and adds columns for added fields. Rows written before a
+field was added hold NULL, which, other than for the fields in `_nulls`, reads as the field's default. Removed
+fields' columns are kept, and ignored. Changes within JSON columns are checked only by reading the latest object.
 
 ## Validating dataclasses
 >`ValidatingDataclassMeta` can be used independently of the `Persistable` framework

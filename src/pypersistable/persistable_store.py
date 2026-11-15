@@ -1,376 +1,60 @@
 import asyncio
 import datetime as dt
-import getpass
-import socket
-import warnings
 from collections.abc import Coroutine, Iterable
-from dataclasses import dataclass, make_dataclass
-from enum import Enum, auto
-from functools import cache
-from graphlib import CycleError, TopologicalSorter
-from typing import Any
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
-from pydantic import ConfigDict
-from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
-from pydantic_core import CoreSchema
-
-from .discriminated_union import STRUCT_LAYOUT
-from .object_store import ObjectStore, WriteConflictError
-from .persistable import Persistable
 from .persistable_id import PersistableId
-from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolver
-from .typed_cache import type_adapter
+
+if TYPE_CHECKING:
+    from .persistable import Persistable
 
 
-@dataclass(kw_only=True)
-class ObjectRecord:
-    """A persisted version of an object. Stores derive the record type of each Persistable type, holding its data"""
-
-    object_id: str
-    effective_time: dt.datetime
-    entry_time: dt.datetime
-    host: str
-    user: str
-    # False once deleted. Records persisted before it was added are active
-    active: bool = True
+class WriteConflictError(Exception):
+    """Writing an object would overwrite a version of it which the writer has not seen"""
 
 
-@dataclass(kw_only=True)
-class _DataRecord(ObjectRecord):
-    """A record holding its object whole, as data: see PersistableStore.record_type"""
+class UnknownObjectError(KeyError):
+    def __init__(self, typ: type, kwargs: dict[str, Any], object_id: PersistableId):
+        self.typ = typ
+        self.kwargs = kwargs
+        self.object_id = object_id
+        super().__init__(f"Unknown object {object_id}")
 
-    data: Any
-
-
-class RecordFormat(Enum):
-    Json = auto()
-    Parquet = auto()
-
-
-def _user() -> str:
-    try:
-        return getpass.getuser()
-    except OSError:  # E.g. in a container, running as a uid with no name
-        return "unknown"
+    def __str__(self) -> str:
+        args = ", ".join(f"{k}={v!r}" for k, v in self.kwargs.items())
+        return f"No object found for {self.typ.__qualname__}({args}) [{self.object_id}]"
 
 
-class _LenientJsonSchema(GenerateJsonSchema):
-    def handle_invalid_for_json_schema(  # pyright: ignore[reportIncompatibleMethodOverride]
-        self, schema: CoreSchema, error_info: str
-    ) -> JsonSchemaValue:
-        # A type with no JSON schema, e.g. an arbitrary class: noted, so that changing it changes the schema
-        return {"description": error_info}
-
-
-class PersistableStore(ObjectStore):
-    def __init__(
-        self,
-        record_format: RecordFormat,
-        require_load_of_existing: bool = False,
-    ):
-        """require_load_of_existing: whether writing over a persisted object requires having read (or written) it"""
-        self.__record_format = record_format
-        self.__require_load_of_existing = require_load_of_existing
-
-    @property
-    def record_format(self) -> RecordFormat:
-        return self.__record_format
-
-    def _read(
-        self,
-        by_type: dict[type[Persistable], set[PersistableId]],
-        effective_time: dt.datetime,
-        entry_time: dt.datetime,
-    ) -> dict[type[Persistable], list[dict[str, Any]] | list[str]]:  # pyright: ignore[reportReturnType]
-        """The latest records for the requested ids: raw JSON strings for RecordFormat.Json, else python objects"""
-
-    def _write(
-        self,
-        by_type: dict[type[Persistable], list[dict[str, Any]]],
-        entry_time: dt.datetime,
-    ): ...
-
-    def _check_types(self, types: set[type[Persistable]]):
-        """Called by write before reading or writing any objects of types, e.g. to check that they can be"""
-
-    @classmethod
-    @cache
-    def record_type(cls, typ: type[Persistable]) -> type[_DataRecord]:
-        return make_dataclass(
-            f"{typ.__qualname__}Record",
-            [("data", typ)],
-            bases=(_DataRecord,),
-            kw_only=True,
-            # base64 in JSON, as bytes need not be valid UTF-8 (pydantic's default)
-            namespace={
-                "__pydantic_config__": ConfigDict(
-                    ser_json_bytes="base64", val_json_bytes="base64"
-                )
-            },
-        )
-
-    @classmethod
-    @cache
-    def _json_schema(cls, typ: type[Persistable]) -> dict[str, Any]:
-        """The JSON schema of typ's records"""
-        return type_adapter(cls.record_type(typ)).json_schema(
-            schema_generator=_LenientJsonSchema
-        )
-
-    def _validate(
-        self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
-    ) -> _DataRecord:
-        """A result of _read, validated as a record of typ"""
-        adapter = type_adapter(self.record_type(typ))
-        validate = (
-            adapter.validate_json
-            if self.__record_format is RecordFormat.Json
-            else adapter.validate_python
-        )
-        return validate(result, context={RESOLVER: resolver})
-
+class PersistableStore:
     def read(
         self,
         object_ids: Iterable[PersistableId],
         effective_time: dt.datetime = dt.datetime.max,
         entry_time: dt.datetime = dt.datetime.max,
-    ) -> dict[PersistableId, Persistable]:
-        """The latest versions of the objects, as of the times, except those deleted"""
-        records = self.__read(
-            object_ids, effective_time, entry_time, ReferenceResolver()
-        )
-        return {i: r.data for i, r in records.items() if r.active}
-
-    def __read(
-        self,
-        object_ids: Iterable[PersistableId],
-        effective_time: dt.datetime,
-        entry_time: dt.datetime,
-        resolver: ReferenceResolver,
-    ) -> dict[PersistableId, _DataRecord]:
-        by_type: dict[type[Persistable], set[PersistableId]] = {}
-        for object_id in object_ids:
-            by_type.setdefault(object_id.typ, set()).add(object_id)
-
-        ret: dict[PersistableId, _DataRecord] = {}
-        unresolved = []  # Records with references, to validate again once those are loaded
-
-        for typ, results in self._read(by_type, effective_time, entry_time).items():
-            for result in results:
-                misses = resolver.misses
-                record = self._validate(typ, result, resolver)
-                if resolver.misses > misses:
-                    unresolved.append((typ, result))
-                else:
-                    ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
-
-        if unresolved:
-            # Load the references in one read, as of the same times, except those this read has already loaded. They
-            # resolve to their latest versions, even if deleted
-            resolver.resolved.update({i: r.data for i, r in ret.items()})
-            to_load = resolver.pending.difference(ret)
-            loaded = (
-                self.__read(to_load, effective_time, entry_time, ReferenceResolver())
-                if to_load
-                else {}
-            )
-            if missing := to_load.difference(loaded):
-                raise RuntimeError(f"Failed to load references {missing!r}")
-
-            resolver.resolved.update({i: r.data for i, r in loaded.items()})
-            for typ, result in unresolved:
-                record = self._validate(typ, result, resolver)
-                ret[PersistableId.parse(record.object_id)] = self.__loaded(record)
-
-        return ret
-
-    @staticmethod
-    def __loaded(record: _DataRecord) -> _DataRecord:
-        record.data._set_object_entry_time(record.entry_time)
-        return record
-
-    def __current(
-        self, object_ids: Iterable[PersistableId]
-    ) -> dict[PersistableId, _DataRecord]:
-        # The latest records, including deleted ones. References are left as ids, which is all comparing records
-        # needs: one read, rather than one per level
-        return self.__read(
-            object_ids,
-            dt.datetime.max,
-            dt.datetime.max,
-            ReferenceResolver(resolve=False),
-        )
-
-    @staticmethod
-    def __metadata(effective_time: dt.datetime) -> dict[str, Any]:
-        """The ObjectRecord fields, other than object_id and active, of the records of a write"""
-        entry_time = dt.datetime.now(dt.UTC)
-        return {
-            "effective_time": effective_time
-            if effective_time != dt.datetime.max
-            else entry_time,
-            "entry_time": entry_time,
-            "host": socket.gethostname(),
-            "user": _user(),
-        }
-
-    def __dump(
-        self,
-        object_id: PersistableId,
-        obj: Persistable,
-        metadata: dict[str, Any],
-        context: dict[str, Any],
-        active: bool = True,
-    ) -> dict[str, Any]:
-        record = self.record_type(type(obj))(
-            object_id=str(object_id), data=obj, active=active, **metadata
-        )
-        parquet = self.__record_format is RecordFormat.Parquet
-        return type_adapter(self.record_type(type(obj))).dump_python(
-            record, mode="python" if parquet else "json", context=context
-        )
-
-    def __conflict(
-        self, object_id: PersistableId, obj: Persistable, stored: ObjectRecord
-    ) -> str | None:
-        # Why writing obj over the persisted version, stored, would be a conflict, if it would
-        version, latest = obj.object_entry_time, stored.entry_time
-        if version is None:
-            # A deleted object may be restored without having been read
-            if stored.active and self.__require_load_of_existing:
-                return f"{object_id}, written at {latest}, was not read before being written"
-        elif version != latest:
-            return f"{object_id} was written at {latest}, since the version written at {version}"
-        return None
-
-    @staticmethod
-    def __raise_conflicts(conflicts: list[str], force_overwrite: bool):
-        if conflicts:
-            if not force_overwrite:
-                raise WriteConflictError("; ".join(conflicts))
-            warnings.warn(f"Overwriting: {'; '.join(conflicts)}", stacklevel=3)
+    ) -> "dict[PersistableId, Persistable]": ...
 
     def write(
         self,
-        objects: Iterable[Persistable],
+        objects: "Iterable[Persistable]",
         effective_time: dt.datetime = dt.datetime.max,
         force_overwrite: bool = False,
         by_reference: bool = True,
-    ):
-        parquet = self.__record_format is RecordFormat.Parquet
-        if parquet and not by_reference:
-            raise ValueError(
-                "by_reference=False is not supported for RecordFormat.Parquet, which persists references as ids"
-            )
-
-        metadata = self.__metadata(effective_time)
-        entry_time: dt.datetime = metadata["entry_time"]
-
-        # Serialise the objects and, if by_reference, those they reference, collected as each is serialised
-        collector = ReferenceCollector()
-        for obj in objects:
-            collector.add(obj)
-
-        context: dict[str, Any] = {STRUCT_LAYOUT: parquet}
-        if by_reference:
-            context[COLLECTOR] = collector
-
-        objs: dict[PersistableId, Persistable] = {}
-        records: dict[PersistableId, dict[str, Any]] = {}
-        while new := collector.take():
-            objs.update(new)
-            for object_id, obj in new.items():
-                collector.referrer = object_id
-                records[object_id] = self.__dump(object_id, obj, metadata, context)
-
-        if collector.conflicts:
-            raise ValueError(
-                f"Different objects with the same id: {', '.join(map(str, collector.conflicts))}"
-            )
-
-        try:
-            TopologicalSorter(collector.graph).prepare()
-        except CycleError as e:
-            # Could not be read: each object must be constructed before those referencing it
-            raise ValueError(
-                f"Reference cycle: {' -> '.join(map(str, e.args[1]))}"
-            ) from None
-
-        # Before reading their current versions, which may fail if they cannot be
-        self._check_types({type(obj) for obj in objs.values()})
-
-        # Versions of the objects written or found unchanged
-        versions: dict[PersistableId, dt.datetime] = {}
-        conflicts: list[str] = []
-        check_context = (
-            {**context, COLLECTOR: ReferenceCollector()} if by_reference else context
-        )
-
-        for i, stored in self.__current(records).items():
-            # Compare serialised data, in which references are ids: a change to a referenced object is not a change.
-            # A deleted object is written even if unchanged, restoring it
-            if (
-                stored.active
-                and self.__dump(i, stored.data, metadata, check_context)["data"]
-                == records[i]["data"]
-            ):
-                del records[i]
-                versions[i] = stored.entry_time
-            elif conflict := self.__conflict(i, objs[i], stored):
-                conflicts.append(conflict)
-
-        self.__raise_conflicts(conflicts, force_overwrite)
-
-        by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
-        for object_id, record in records.items():
-            by_type.setdefault(object_id.typ, []).append(record)
-
-        if by_type:
-            self._write(by_type, entry_time)
-
-        versions.update(dict.fromkeys(records, entry_time))
-        for object_id, version in versions.items():
-            objs[object_id]._set_object_entry_time(version)
+    ): ...
 
     def delete(
         self,
-        objects: Iterable[Persistable],
+        objects: "Iterable[Persistable]",
         effective_time: dt.datetime = dt.datetime.max,
         force_overwrite: bool = False,
-    ):
-        """Marks the objects deleted, as of effective_time, so that read no longer finds them until they are written again.
-
-        Their persisted data is kept: reads as of earlier times find them. Objects not persisted, or already deleted, are
-        ignored. Raises WriteConflictError, unless force_overwrite, as write does.
-        """
-        objs = {obj.object_id: obj for obj in objects}
-        self._check_types({type(obj) for obj in objs.values()})
-        current = {i: r for i, r in self.__current(objs).items() if r.active}
-        self.__raise_conflicts(
-            [c for i, r in current.items() if (c := self.__conflict(i, objs[i], r))],
-            force_overwrite,
-        )
-
-        # The persisted data, not the objects', which may have been changed
-        metadata = self.__metadata(effective_time)
-        entry_time: dt.datetime = metadata["entry_time"]
-        context = {STRUCT_LAYOUT: self.__record_format is RecordFormat.Parquet}
-        by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
-        for object_id, stored in current.items():
-            by_type.setdefault(object_id.typ, []).append(
-                self.__dump(object_id, stored.data, metadata, context, active=False)
-            )
-
-        if by_type:
-            self._write(by_type, entry_time)
-            for object_id in current:
-                objs[object_id]._set_object_entry_time(entry_time)
+    ): ...
 
     @staticmethod
     def read_all(
-        *reads: Coroutine[Any, Any, Persistable],
+        *reads: "Coroutine[Any, Any, Persistable]",
         loop: asyncio.AbstractEventLoop | None = None,
-    ) -> list[Persistable]:
+    ) -> "list[Persistable]":
         async def gather_reads():
             return await asyncio.gather(*reads)
 
@@ -378,3 +62,73 @@ class PersistableStore(ObjectStore):
             return asyncio.run(gather_reads())
 
         return loop.run_until_complete(gather_reads())
+
+
+@dataclass(frozen=True)
+class _ReadKey:
+    db_id: int
+    effective_time: dt.datetime
+    entry_time: dt.datetime
+
+
+class ReadBatch:
+    __current: ClassVar[ContextVar[Self | None]] = ContextVar(
+        "ReadBatch.current", default=None
+    )
+
+    def __init__(self):
+        self.__pending: dict[_ReadKey, tuple[PersistableStore, set[PersistableId]]] = {}
+        self.__tasks: (
+            dict[_ReadKey, asyncio.Future[dict[PersistableId, Any]]] | None
+        ) = None
+
+    @classmethod
+    def current(cls) -> Self:
+        if (current := cls.__current.get()) is None or current.dispatched:
+            current = cls()
+            cls.__current.set(current)
+        return current
+
+    @property
+    def dispatched(self) -> bool:
+        return self.__tasks is not None
+
+    def dispatch(self):
+        if self.dispatched:
+            return
+
+        pending, self.__pending = self.__pending, {}
+        self.__tasks = {
+            key: asyncio.ensure_future(
+                asyncio.to_thread(db.read, oids, key.effective_time, key.entry_time)
+            )
+            for key, (db, oids) in pending.items()
+        }
+
+    def enqueue(
+        self,
+        db: PersistableStore,
+        typ: type,
+        object_id: PersistableId,
+        kwargs: dict[str, Any],
+        effective_time: dt.datetime = dt.datetime.max,
+        entry_time: dt.datetime = dt.datetime.max,
+    ):
+        if self.dispatched:
+            raise RuntimeError("Cannot enqueue after dispatch")
+
+        key = _ReadKey(id(db), effective_time, entry_time)
+        self.__pending.setdefault(key, (db, set()))[1].add(object_id)
+        return self.__result(key, typ, object_id, dict(kwargs))
+
+    async def __result(
+        self, key: _ReadKey, typ: type, object_id: PersistableId, kwargs: dict[str, Any]
+    ) -> Any:
+        self.dispatch()
+        assert self.__tasks is not None
+
+        results = await self.__tasks[key]
+        if object_id not in results:
+            raise UnknownObjectError(typ, kwargs, object_id)
+
+        return results[object_id]
