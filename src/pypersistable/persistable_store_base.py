@@ -1,5 +1,6 @@
 import datetime as dt
 import getpass
+import math
 import socket
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
@@ -422,3 +423,20 @@ def _batches(
             batches.append((i.typ, []))
         batches[positions[i]][1].append(records[i])
     return batches
+
+
+def _check_finite(record: Mapping[str, Any]):
+    """Raises ValueError if a record, as python mode serialisation returns it, holds NaN or an infinity: JSON has none,
+    so pydantic would write null"""
+
+    def non_finite(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(map(non_finite, value.values()))
+        if isinstance(value, list | tuple | set | frozenset):
+            return any(map(non_finite, value))
+        return isinstance(value, float) and not math.isfinite(value)
+
+    if non_finite(record["_data"]):
+        raise ValueError(
+            f"{record['_object_id']} holds NaN or an infinity, which JSON cannot represent"
+        )

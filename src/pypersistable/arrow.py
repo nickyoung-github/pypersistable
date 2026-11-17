@@ -154,7 +154,8 @@ class ArrowConverter:
         """Plain python data, e.g. pydantic's python mode serialisation, as pyarrow accepts it for arrow_type.
 
         Structs must already be dicts: they are not converted. Raises ValueError for a naive datetime with a time zone
-        aware arrow_type, which pyarrow would otherwise silently treat as UTC.
+        aware arrow_type, which pyarrow would otherwise silently treat as UTC, and for a time zone aware time, whose time
+        zone pyarrow would silently drop.
         """
         if value is None:
             return None
@@ -179,6 +180,11 @@ class ArrowConverter:
         ):
             raise ValueError(
                 f"Naive datetime {value} for a time zone aware timestamp: use NaiveDatetime for no time zone"
+            )
+        if pa.types.is_time(arrow_type) and value.tzinfo is not None:
+            # Not converted to UTC: without a date, a time's offset may be unknown, e.g. for a ZoneInfo
+            raise ValueError(
+                f"Time zone aware time {value}: {arrow_type} has no time zone"
             )
 
         typ = type(value)

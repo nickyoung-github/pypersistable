@@ -3,6 +3,7 @@
 import contextlib
 import dataclasses
 import datetime as dt
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
@@ -26,6 +27,7 @@ from models import (
     Kennel,
     ModelDeal,
     Node,
+    Option,
     PlainUnion,
     TradingBook,
     loopback_ok,
@@ -616,6 +618,12 @@ FIELD_TYPES = {
     ),
     "date": (dt.date, dt.date(2026, 1, 2), {}),
     "time": (dt.time, dt.time(3, 4, 5), {}),
+    "aware_time": (
+        dt.time,
+        dt.time(3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+        # Its time zone would be lost: Arrow's times have none
+        dict.fromkeys(("Parquet", *SQL), ValueError),
+    ),
     "naive_datetime": (
         dt.datetime,
         naive,
@@ -642,6 +650,13 @@ FIELD_TYPES = {
     "optional_none": (int | None, None, {}),
     "dict": (dict[str, int], {"a": 1}, {}),
     "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
+    # JSON has no infinities (nor NaN: see test_nan)
+    "infinity": (float, float("inf"), dict.fromkeys(("Json", *SQL), ValueError)),
+    "nested_infinity": (
+        dict[Colour, list[float]],
+        {Colour.Red: [float("-inf")]},
+        dict.fromkeys(("Json", *SQL), ValueError),
+    ),
     # Persisted by name, but validated by alias, unless by name too
     "aliased": (Annotated[int, Field(alias="v")], 1, {}),
     # Members not persisted as objects: tagged, so a date is not read as a str
@@ -686,6 +701,20 @@ def test_field_type_round_trip(make_store, store_kind, holder, value, failures):
     # Unchanged: compared with its persisted schema by a new store, then not rewritten
     read.write(make_store())
     assert read.object_entry_time == obj.object_entry_time
+
+
+def test_nan(store, store_kind):
+    option = Option(ticker="X", strike=float("nan"))
+    if store_kind != "Parquet":
+        # JSON has no NaN: pydantic would write null
+        with pytest.raises(ValueError, match="holds NaN or an infinity"):
+            option.write(store)
+        assert store.read([option.object_id]) == {}
+        return
+
+    option.write(store)
+    # Not equal to itself, so not compared
+    assert math.isnan(store.read([option.object_id])[option.object_id].strike)
 
 
 # Schema evolution: each type is another version of the one before, as if its code had been changed

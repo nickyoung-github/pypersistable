@@ -20,7 +20,7 @@ from .arrow import ArrowConverter, UnsupportedTypeError
 from .discriminated_union import STRUCT_LAYOUT, TAG_FIELD, DiscriminatedUnionInfo
 from .persistable import Persistable
 from .persistable_id import PersistableId
-from .persistable_store_base import PersistableStoreBase, _DataRecord
+from .persistable_store_base import PersistableStoreBase, _check_finite, _DataRecord
 from .reference import RESOLVER, ReferenceResolver, _Reference
 from .type_registry import TypeRegistry
 from .typed_cache import type_adapter
@@ -341,7 +341,11 @@ class FSStore(PersistableStoreBase):
         self, record: _DataRecord, context: dict[str, Any]
     ) -> dict[str, Any]:
         parquet = self.record_format is RecordFormat.Parquet
-        return type_adapter(type(record)).dump_python(
+        adapter = type_adapter(type(record))
+        if not parquet:
+            # Checked in python mode, as JSON mode has already written them as null
+            _check_finite(adapter.dump_python(record, context=context))
+        return adapter.dump_python(
             record,
             mode="python" if parquet else "json",
             context={**context, STRUCT_LAYOUT: parquet},
