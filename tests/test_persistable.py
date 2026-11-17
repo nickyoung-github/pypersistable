@@ -279,6 +279,7 @@ def test_enqueue_after_dispatch_raises():
         )
 
 
+@loopback_ok
 def test_read_all_with_loop():
     counterparty = Counterparty(name="Acme")
     store = DictStore(counterparty)
