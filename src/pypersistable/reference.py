@@ -30,7 +30,6 @@ class ReferenceResolver:
         self.resolve = resolve
         self.resolved: dict[PersistableId, Persistable] = {}
         self.pending: set[PersistableId] = set()
-        self.misses = 0
 
     def get(self, object_id: PersistableId) -> Persistable | PersistableId:
         if not self.resolve:
@@ -39,7 +38,6 @@ class ReferenceResolver:
             return obj
 
         self.pending.add(object_id)
-        self.misses += 1
         return object_id
 
 
@@ -48,12 +46,13 @@ class ReferenceCollector:
 
     Each object's id is computed once, however often it is referenced. Set referrer to the id of the object being
     serialised to record what it references in graph. Ids of unequal objects sharing them are added to conflicts.
+    instances holds every instance of each object, as equal instances may be distinct.
     """
 
     def __init__(self):
         # By id(obj), which is safe as the objects outlive the write
         self.__ids: dict[int, PersistableId] = {}
-        self.__objects: dict[PersistableId, Persistable] = {}
+        self.instances: dict[PersistableId, list[Persistable]] = {}
         self.__new: dict[PersistableId, Persistable] = {}
         self.referrer: PersistableId | None = None
         self.graph: dict[PersistableId, set[PersistableId]] = {}
@@ -62,12 +61,14 @@ class ReferenceCollector:
     def add(self, obj: Persistable) -> PersistableId:
         if (object_id := self.__ids.get(id(obj))) is None:
             object_id = self.__ids[id(obj)] = obj.object_id
-            if (existing := self.__objects.get(object_id)) is None:
-                self.__objects[object_id] = self.__new[object_id] = obj
-            elif existing != obj:
-                self.conflicts.add(
-                    object_id
-                )  # Not raised here, as pydantic would wrap the error
+            if (instances := self.instances.get(object_id)) is None:
+                self.instances[object_id] = [obj]
+                self.__new[object_id] = obj
+            else:
+                if instances[0] != obj:
+                    # Not raised here, as pydantic would wrap the error
+                    self.conflicts.add(object_id)
+                instances.append(obj)
 
         if self.referrer is not None:
             self.graph.setdefault(self.referrer, set()).add(object_id)
