@@ -297,7 +297,7 @@ The Parquet schema is generated from the type hints, with:
 - Plain `datetime`s stored as UTC timestamps, keeping their instant: writing a naive value raises a `ValueError`.
   Use pydantic's `NaiveDatetime` for a timestamp without a time zone (or `AwareDatetime` to validate as aware)
 - `Decimal`s as `decimal128`, with the precision and scale from pydantic's `max_digits`/`decimal_places`
-  if given, else (38, 18)
+  if given, else (38, 18). `max_digits` without `decimal_places` raises `UnsupportedTypeError`, as of no fixed scale
 - `Enum` and `Literal` stored as their values, which must be of one type
 - `tuple`, `set` and `frozenset` as lists, whose items must be of one type
 - `dict` as maps
