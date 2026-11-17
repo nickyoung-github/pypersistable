@@ -219,9 +219,13 @@ def _decimal_precision_scale(metadata: tuple[Any, ...]) -> tuple[int, int]:
     for constraint in (c for m in metadata for c in (m, *getattr(m, "metadata", ()))):
         digits = getattr(constraint, "max_digits", None)
         places = getattr(constraint, "decimal_places", None)
-        if digits is not None or places is not None:
-            precision = digits or _DECIMAL_PRECISION
-            scale = places if places is not None else min(_DECIMAL_SCALE, precision)
-            return precision, scale
+        if places is not None:
+            # max_digits includes the decimal places, as does precision the scale
+            return digits or _DECIMAL_PRECISION, places
+        if digits is not None:
+            # Otherwise of no fixed scale: e.g. max_digits=5 allows 12345 and 0.00001
+            raise UnsupportedTypeError(
+                f"Decimal max_digits={digits} needs decimal_places, to fix the scale of decimal128"
+            )
 
     return _DECIMAL_PRECISION, _DECIMAL_SCALE

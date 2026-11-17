@@ -36,6 +36,7 @@ from pypersistable import (
     Identifiable,
     IdField,
     IncompatibleSchemaError,
+    Reference,
     UnknownObjectError,
     UnsupportedTypeError,
     WriteConflictError,
@@ -137,7 +138,7 @@ def test_base_model_with_reference_and_discriminated_union(store):
 
 @pytest.fixture
 def spy(store, monkeypatch):
-    """Records, per call, the number of ids queried by type (reads) and records written by type (writes)"""
+    """Records, per call, the number of ids queried by type (reads) and of records written per batch (writes)"""
     calls = {"reads": [], "writes": []}
     read, write = store._read, store._write
 
@@ -145,11 +146,9 @@ def spy(store, monkeypatch):
         calls["reads"].append({t.__name__: len(ids) for t, ids in by_type.items()})
         return read(by_type, *args)
 
-    def spy_write(by_type, *args):
-        calls["writes"].append(
-            {t.__name__: len(records) for t, records in by_type.items()}
-        )
-        return write(by_type, *args)
+    def spy_write(batches, *args):
+        calls["writes"].append([(t.__name__, len(records)) for t, records in batches])
+        return write(batches, *args)
 
     monkeypatch.setattr(store, "_read", spy_read)
     monkeypatch.setattr(store, "_write", spy_write)
@@ -172,7 +171,10 @@ def test_write_accepts_a_generator(store):
 
 def test_shared_references_are_written_once(store, spy):
     store.write(shared_deals())
-    assert spy["writes"] == [{"Deal": 3, "Counterparty": 1, "TradingBook": 1}]
+    (batches,) = spy["writes"]
+    # Referenced objects first
+    assert sorted(batches[:2]) == [("Counterparty", 1), ("TradingBook", 1)]
+    assert batches[2] == ("Deal", 3)
 
 
 def test_unchanged_objects_and_references_are_not_rewritten(store, spy):
@@ -197,7 +199,7 @@ def test_changed_reference_is_written(store, spy):
     store.write([deal])
 
     # Only the counterparty: the deal's record, referencing it by id, is unchanged
-    assert spy["writes"][-1] == {"Counterparty": 1}
+    assert spy["writes"][-1] == [("Counterparty", 1)]
     assert Deal.read(store, deal_id="D0") == deal
 
 
@@ -272,7 +274,7 @@ def test_delete_ignores_unpersisted_and_deleted(store, spy):
     node.write(store)
     node.del_(store)
     node.del_(store)
-    assert spy["writes"] == [{"Node": 1}, {"Node": 1}]
+    assert spy["writes"] == [[("Node", 1)], [("Node", 1)]]
 
 
 def test_write_restores_deleted(store):
@@ -322,7 +324,7 @@ def test_write_restores_deleted_reference(store, spy):
 
     # Unchanged itself, but writes the deleted object it references, restoring it
     head.write(store)
-    assert spy["writes"][-1] == {"Node": 1}
+    assert spy["writes"][-1] == [("Node", 1)]
     assert Node.read(store, name="b") == tail
 
 
@@ -383,7 +385,43 @@ def test_changed_object_is_rewritten(store, spy):
     deal = shared_deals(1)[0]
     store.write([deal])
     store.write([dataclasses.replace(deal, backup=Counterparty(name="Backup"))])
-    assert spy["writes"][-1] == {"Deal": 1, "Counterparty": 1}
+    assert spy["writes"][-1] == [("Counterparty", 1), ("Deal", 1)]
+
+
+@dataclass(kw_only=True)
+class Left(Identifiable):
+    name: IdField[str]
+    right: "Reference[Right] | None" = None
+
+
+@dataclass(kw_only=True)
+class Right(Identifiable):
+    name: IdField[str]
+    left: Reference[Left] | None = None
+
+
+registry.register("Left", Left)
+registry.register("Right", Right)
+
+
+def test_written_in_batches_referenced_first(store, spy):
+    # Of one type, so one batch
+    Node(name="a", next=Node(name="b", next=Node(name="c"))).write(store)
+    # Of types referencing each other: a Left after the Right after the Left
+    left = Left(name="a", right=Right(name="b", left=Left(name="c")))
+    left.write(store)
+
+    assert spy["writes"] == [[("Node", 3)], [("Left", 1), ("Right", 1), ("Left", 1)]]
+    assert Left.read(store, name="a") == left
+
+
+def test_object_effective_later_is_rewritten(store):
+    now, year = dt.datetime.now(dt.UTC), dt.timedelta(days=365)
+    Node(name="b").write(store, effective_time=now + year)
+    # Unchanged, but rewritten: else not found as of a's effective time
+    node = Node(name="a", next=Node(name="b"))
+    node.write(store, effective_time=now - year)
+    assert Node.read(store, name="a", effective_time=now) == node
 
 
 def test_concurrent_async_reads(store):
@@ -530,6 +568,17 @@ FIELD_TYPES = {
         Decimal("12.50"),
         {},
     ),
+    "decimal_wide": (
+        Annotated[Decimal, Field(max_digits=30, decimal_places=10)],
+        Decimal("12345678901234567890.0123456789"),
+        {},
+    ),
+    "decimal_unscaled": (
+        Annotated[Decimal, Field(max_digits=5)],
+        Decimal(12345),
+        # Of no fixed scale. For SQL, as JSON
+        {"Parquet": UnsupportedTypeError},
+    ),
     "date": (dt.date, dt.date(2026, 1, 2), {}),
     "time": (dt.time, dt.time(3, 4, 5), {}),
     "naive_datetime": (
@@ -558,6 +607,9 @@ FIELD_TYPES = {
     "optional_none": (int | None, None, {}),
     "dict": (dict[str, int], {"a": 1}, {}),
     "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
+    # Members not persisted as objects: tagged, so a date is not read as a str
+    "union_of_date_str": (DiscriminatedUnion[dt.date, str], dt.date(2026, 1, 2), {}),
+    "union_of_enum_int": (DiscriminatedUnion[Shape, int], Shape.Square, {}),
 }
 
 

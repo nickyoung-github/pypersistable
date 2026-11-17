@@ -101,11 +101,14 @@ class _Reference:
                     f"{{{RESOLVER!r}: ReferenceResolver}}"
                 )
 
-            # A persisted reference: not validated as source_type, as it may resolve to its id for now
-            return resolver.get(
+            # A persisted reference: validated as source_type, unless it resolves to its id for now
+            resolved = resolver.get(
                 value
                 if isinstance(value, PersistableId)
                 else PersistableId.parse(value)
+            )
+            return (
+                resolved if isinstance(resolved, PersistableId) else validator(resolved)
             )
 
         def serialise(

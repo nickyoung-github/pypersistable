@@ -22,8 +22,8 @@ class ListStore(PersistableStoreBase):
             ret[typ] = list(latest.values())
         return ret
 
-    def _write(self, by_type, entry_time, expected):
-        for typ, records in by_type.items():
+    def _write(self, batches, entry_time, expected):
+        for typ, records in batches:
             self.records.setdefault(typ, []).extend(records)
 
 

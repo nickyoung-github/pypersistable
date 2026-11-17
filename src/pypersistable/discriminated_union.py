@@ -22,6 +22,18 @@ class _TagJsonSchema:
     ):
         json_schema = handler(schema)
         resolved = handler.resolve_ref_schema(json_schema)
+
+        if resolved.get("type") != "object":
+            # Handle the case where the schema is not an object, e.g. a literal or enum
+            return {
+                "type": "object",
+                "properties": {
+                    self.__tag_field: {"const": self.__tag_value},
+                    self.__tag_value: json_schema,
+                },
+                "required": [self.__tag_field, self.__tag_value],
+            }
+
         return {
             **resolved,
             "properties": {
@@ -62,25 +74,14 @@ else:
 
             def strip_tag(value: Any) -> Any:
                 if isinstance(value, dict):
+                    if (value_tag := value.get(TAG_FIELD)) in value:
+                        return value[value_tag]
                     return {k: v for k, v in value.items() if k != TAG_FIELD}
-                return value
-
-            def from_struct(value: Any) -> Any:
-                if (
-                    isinstance(value, dict)
-                    and (value_tag := value.get(TAG_FIELD)) in value
-                ):
-                    data = value[value_tag]
-                    return (
-                        {TAG_FIELD: value_tag, **data}
-                        if isinstance(data, dict)
-                        else data
-                    )
                 return value
 
             def discriminate(value: Any) -> str | None:
                 if isinstance(value, dict):
-                    return value[TAG_FIELD]
+                    return value.get(TAG_FIELD)
                 elif isinstance(value, params):
                     return tag(type(value))
                 return None
@@ -91,7 +92,9 @@ else:
                 if (info.context or {}).get(STRUCT_LAYOUT):
                     return {TAG_FIELD: value_tag, value_tag: data}
                 return (
-                    {TAG_FIELD: value_tag, **data} if isinstance(data, dict) else data
+                    {TAG_FIELD: value_tag, **data}
+                    if isinstance(data, dict)
+                    else {TAG_FIELD: value_tag, value_tag: data}
                 )
 
             union_members = tuple(
@@ -107,7 +110,6 @@ else:
             return Annotated[
                 Union[union_members],  # noqa: UP007
                 Discriminator(discriminate),
-                BeforeValidator(from_struct),
                 WrapSerializer(serialise),
                 DiscriminatedUnionInfo(tuple((tag(t), t) for t in params)),
             ]

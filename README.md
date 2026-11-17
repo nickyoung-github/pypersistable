@@ -129,7 +129,9 @@ Two stores are provided: `FSStore`, below, and `SQLStore`, in a SQL database (se
 `FSStore` writes objects into directories, formed
 from the store's root, the `TypeRegistry` root and registered name.
 Each write creates a new file per type, named by the timestamp of the write, which corresponds to the persisted
-records' `_entry_time`, and a unique suffix, as concurrent writers may share a timestamp.
+records' `_entry_time`, and a unique suffix, as concurrent writers may share a timestamp. Files are written in an order
+in which objects follow those they reference (with more than one file per type if types reference each other), so a
+write in progress, or one failing part way, leaves no reference to an object not written.
 
 Reading uses `duckdb` to read the stored Parquet/JSON files. Currently only querying by an object's id
 is supported, but this approach also allows for querying by attributes of the object in future.
@@ -189,7 +191,8 @@ Each object read or written records the entry time of its persisted version, as 
 (`None` for an object constructed anew, or by `dataclasses.replace`). `write` checks the objects written, and those
 they reference, against their persisted versions:
 
-- Unchanged objects are not written again
+- Unchanged objects are not written again, unless persisted with a later effective time (e.g. when referenced by an
+  object written with an earlier one), which reads as of the write's effective time would not find
 - An object which is out of date, i.e. persisted since its version (e.g. by someone else), raises a
   `WriteConflictError`
 - If the store requires it (`require_load_of_existing=True`), an object which is persisted but was not read or written,
@@ -297,7 +300,7 @@ The Parquet schema is generated from the type hints, with:
 - Plain `datetime`s stored as UTC timestamps, keeping their instant: writing a naive value raises a `ValueError`.
   Use pydantic's `NaiveDatetime` for a timestamp without a time zone (or `AwareDatetime` to validate as aware)
 - `Decimal`s as `decimal128`, with the precision and scale from pydantic's `max_digits`/`decimal_places`
-  if given, else (38, 18)
+  if given, else (38, 18). `max_digits` without `decimal_places` raises `UnsupportedTypeError`, as of no fixed scale
 - `Enum` and `Literal` stored as their values, which must be of one type
 - `tuple`, `set` and `frozenset` as lists, whose items must be of one type
 - `dict` as maps

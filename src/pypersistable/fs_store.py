@@ -1,6 +1,6 @@
 import datetime as dt
 import warnings
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum, auto
 from itertools import pairwise
 from pathlib import Path
@@ -401,16 +401,16 @@ class FSStore(PersistableStoreBase):
 
     def _write(
         self,
-        by_type: dict[type[Persistable], list[dict[str, Any]]],
+        batches: Sequence[tuple[type[Persistable], list[dict[str, Any]]]],
         entry_time: dt.datetime,
         expected: Mapping[PersistableId, dt.datetime | None],
     ):
-        # Files are only added, so writes cannot be checked for concurrent changes: expected is ignored
-        filename = _filename(entry_time)
-        for typ, records in by_type.items():
+        # Files are only added, so writes cannot be checked for concurrent changes: expected is ignored. A file per
+        # batch, in order, so that a reader, or a write failing part way, leaves no reference to an object not written
+        for typ, records in batches:
             directory = self.__directory(typ)
             self.__fs.makedirs(directory, exist_ok=True)
-            path = directory / filename
+            path = directory / _filename(entry_time)
 
             if self.record_format is RecordFormat.Parquet:
                 schema = self.__arrow.arrow_schema(self.record_type(typ))

@@ -71,3 +71,7 @@ omit = ["*/_version.py"]
 show_missing = true
 skip_covered = true
 fail_under = 97
+
+[tool.pytest.ini_options]
+# pytest-recording's, registered for runs without it
+markers = ["block_network: block network access, except to allowed_hosts"]
