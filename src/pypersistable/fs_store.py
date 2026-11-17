@@ -3,7 +3,7 @@ import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum, auto
 from itertools import pairwise
-from pathlib import Path
+from pathlib import PurePosixPath
 from types import NoneType, UnionType
 from typing import Annotated, Any, Union, get_args, get_origin
 from uuid import uuid4
@@ -162,7 +162,8 @@ class FSStore(PersistableStoreBase):
         self.__record_format = record_format
         self.__arrow = arrow_converter or _ARROW_CONVERTER
         self.__fs, root = url_to_fs(url)
-        self.__root = Path(root)
+        # fsspec's paths are /-separated for every file system, including local ones on Windows
+        self.__root = PurePosixPath(root)
         self.__conn = duckdb.connect()
         self.__conn.register_filesystem(self.__fs)
         # Schemas of Parquet files by path, which are never rewritten
@@ -235,7 +236,7 @@ class FSStore(PersistableStoreBase):
             )
         return file_type
 
-    def __directory(self, typ: type[Persistable]) -> Path:
+    def __directory(self, typ: type[Persistable]) -> PurePosixPath:
         # Store root / TypeRegistry root / registered name
         registry = TypeRegistry[Persistable]()
         return self.__root / registry.root(typ) / registry.registered_name(typ)
@@ -381,7 +382,7 @@ class FSStore(PersistableStoreBase):
                 )
 
         # The latest object written under each schema (or before the first recorded)
-        starts = [_entry_time(Path(v).name) for v in versions]
+        starts = [_entry_time(PurePosixPath(v).name) for v in versions]
         latest = (
             "{entry_time} >= ? AND {entry_time} < ? ORDER BY {entry_time} DESC LIMIT 1"
         )
