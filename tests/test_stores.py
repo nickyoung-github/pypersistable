@@ -642,6 +642,8 @@ FIELD_TYPES = {
     "optional_none": (int | None, None, {}),
     "dict": (dict[str, int], {"a": 1}, {}),
     "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
+    # Persisted by name, but validated by alias, unless by name too
+    "aliased": (Annotated[int, Field(alias="v")], 1, {}),
     # Members not persisted as objects: tagged, so a date is not read as a str
     "union_of_date_str": (DiscriminatedUnion[dt.date, str], dt.date(2026, 1, 2), {}),
     "union_of_enum_int": (DiscriminatedUnion[Shape, int], Shape.Square, {}),

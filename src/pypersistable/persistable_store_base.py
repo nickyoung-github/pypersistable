@@ -130,8 +130,9 @@ class PersistableStoreBase(PersistableStore):
         self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
     ) -> _DataRecord:
         """A result of _read, validated as a record of typ"""
+        # By name too: records are dumped by field name, also for fields with aliases, which pydantic validates by
         return type_adapter(self.record_type(typ)).validate_python(
-            result, context={RESOLVER: resolver}
+            result, context={RESOLVER: resolver}, by_name=True
         )
 
     def read(

@@ -353,7 +353,7 @@ class FSStore(PersistableStoreBase):
         if self.record_format is RecordFormat.Parquet:
             return super()._validate(typ, result, resolver)
         return type_adapter(self.record_type(typ)).validate_json(
-            result, context={RESOLVER: resolver}
+            result, context={RESOLVER: resolver}, by_name=True
         )
 
     @property
