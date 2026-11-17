@@ -32,6 +32,10 @@ from pypersistable import (
 from pypersistable.persistable import Persistable
 from pypersistable.persistable_store import PersistableStore, ReadBatch
 
+# On Windoes the asyncio event loop makes its self-pipe from a loopback TCP connection
+# Tests which run with --block-network fail
+loopback_ok = pytest.mark.block_network(allow_hosts=["127.0.0.1"])
+
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
     # Pins the id format: changing it orphans everything already persisted
@@ -241,6 +245,7 @@ def test_read_rejects_extra_and_missing_id_fields():
         Counterparty.read(DictStore())
 
 
+@loopback_ok
 def test_async_reads_are_batched_into_one_store_read():
     counterparty, book = Counterparty(name="Acme"), TradingBook(name="Acme")
     store = DictStore(counterparty, book)
@@ -256,6 +261,7 @@ def test_async_reads_are_batched_into_one_store_read():
     assert set(store.reads[0]) == {counterparty.object_id, book.object_id}
 
 
+@loopback_ok
 def test_async_read_unknown_object_raises():
     async def read():
         return await Counterparty.read(DictStore(), is_async=True, name="Nobody")

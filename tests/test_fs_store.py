@@ -1,6 +1,6 @@
 """Tests of FSStore's own behaviour: see test_stores for those of every store"""
 
-import os
+import sys
 from dataclasses import dataclass
 from ipaddress import IPv4Address
 from uuid import uuid4
@@ -90,9 +90,7 @@ def test_parquet_records_written_before_active(tmp_path):
     assert Node.read(FSStore(f"file://{tmp_path}"), name="a") == node
 
 
-@pytest.mark.skipif(
-    os.geteuid() == 0, reason="root can read files without read permission"
-)
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows doesn't support chmod")
 def test_unreadable_file_raises(store, tmp_path):
     Counterparty(name="Acme").write(store)
     for path in (tmp_path / "Counterparty").iterdir():
