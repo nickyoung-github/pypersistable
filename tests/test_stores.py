@@ -530,6 +530,17 @@ FIELD_TYPES = {
         Decimal("12.50"),
         {},
     ),
+    "decimal_wide": (
+        Annotated[Decimal, Field(max_digits=30, decimal_places=10)],
+        Decimal("12345678901234567890.0123456789"),
+        {},
+    ),
+    "decimal_unscaled": (
+        Annotated[Decimal, Field(max_digits=5)],
+        Decimal(12345),
+        # Of no fixed scale. For SQL, as JSON
+        {"Parquet": UnsupportedTypeError},
+    ),
     "date": (dt.date, dt.date(2026, 1, 2), {}),
     "time": (dt.time, dt.time(3, 4, 5), {}),
     "naive_datetime": (
@@ -558,6 +569,9 @@ FIELD_TYPES = {
     "optional_none": (int | None, None, {}),
     "dict": (dict[str, int], {"a": 1}, {}),
     "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
+    # Members not persisted as objects: tagged, so a date is not read as a str
+    "union_of_date_str": (DiscriminatedUnion[dt.date, str], dt.date(2026, 1, 2), {}),
+    "union_of_enum_int": (DiscriminatedUnion[Shape, int], Shape.Square, {}),
 }
 
 
