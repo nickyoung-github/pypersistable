@@ -31,7 +31,7 @@ class _ValidatingFieldDescriptor:
     def _validate(self, value: Any) -> Any:
         if _CONSTRUCTING.get():
             return value
-        return self._adapter.validate_python(value, strict=True)
+        return self._adapter.validate_python(value)
 
     def _no_attribute(self) -> AttributeError:
         return AttributeError(
@@ -153,7 +153,7 @@ def _install_descriptors(cls: type):
 
 
 class ValidatingDataclassMeta(type):
-    """Validates, in strict mode, each value assigned to a field of a dataclass of this metaclass"""
+    """Validates each value assigned to a field of a dataclass of this metaclass"""
 
     def __new__(
         mcs,
