@@ -7,9 +7,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      # Each OS and version runs to completion, though another fails
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python-version: ["3.13", "3.14"]
     # SQLStore is tested on SQLite only: set PYPERSISTABLE_TEST_POSTGRES_URL to also test it on PostgreSQL
     steps:
