@@ -31,7 +31,7 @@ class _ValidatingFieldDescriptor:
     def _validate(self, value: Any) -> Any:
         if _CONSTRUCTING.get():
             return value
-        return self._adapter.validate_python(value, strict=True)
+        return self._adapter.validate_python(value)
 
     def _no_attribute(self) -> AttributeError:
         return AttributeError(
