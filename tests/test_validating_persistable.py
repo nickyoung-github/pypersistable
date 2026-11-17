@@ -98,7 +98,7 @@ def test_assignment_validated(models):
     with pytest.raises(ValidationError, match="is a persisted reference"):
         branch.leaf = "VLeaf/abc"
     with pytest.raises(ValidationError):
-        leaf_type(name="l", value="1")
+        leaf_type(name="l", value="a")
 
 
 def test_reference_id_field(store):
