@@ -153,7 +153,7 @@ def _install_descriptors(cls: type):
 
 
 class ValidatingDataclassMeta(type):
-    """Validates, in strict mode, each value assigned to a field of a dataclass of this metaclass"""
+    """Validates each value assigned to a field of a dataclass of this metaclass"""
 
     def __new__(
         mcs,

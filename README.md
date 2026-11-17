@@ -366,7 +366,7 @@ fields' columns are kept, and ignored. Changes within JSON columns are checked o
 ## Validating dataclasses
 >`ValidatingDataclassMeta` can be used independently of the `Persistable` framework
 
-`ValidatingDataclassMeta` validates each value assigned to a field of a dataclass, with pydantic in strict mode: in
+`ValidatingDataclassMeta` validates each value assigned to a field of a dataclass, with pydantic: in
 `__init__` (including defaults and `__post_init__`) and on any subsequent setting of fields.
 
 ```python
@@ -383,7 +383,8 @@ class Hound(metaclass=ValidatingDataclassMeta):
 
 
 hound = Hound(name="Cerberus", heads=3)
-hound.heads = "3"  # Raises pydantic.ValidationError: strict, so not coerced
+hound.heads = "3"  # Coerced to 3, as pydantic is not in strict mode
+hound.heads = "three"  # Raises pydantic.ValidationError
 ```
 
 - Dataclasses with or without slots, frozen dataclasses and subclasses are supported
