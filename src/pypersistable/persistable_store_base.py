@@ -153,41 +153,48 @@ class PersistableStoreBase(PersistableStore):
         entry_time: dt.datetime,
         resolver: ReferenceResolver,
     ) -> dict[PersistableId, _DataRecord]:
-        by_type: dict[type[Persistable], set[PersistableId]] = {}
-        for object_id in object_ids:
-            by_type.setdefault(object_id.typ, set()).add(object_id)
-
         ret: dict[PersistableId, _DataRecord] = {}
-        unresolved = []  # Records with references, to validate again once those are loaded
+        # Records referencing objects not yet loaded, with the ids of those, to validate again once they are
+        unresolved: dict[
+            PersistableId, tuple[type[Persistable], Any, set[PersistableId]]
+        ] = {}
+        fetched: set[PersistableId] = set()
+        to_fetch = requested = set(object_ids)
+        # A level of references at a time, as of the same times. They resolve to their latest versions, even if deleted
+        while to_fetch:
+            fetched |= to_fetch
+            by_type: dict[type[Persistable], set[PersistableId]] = {}
+            for object_id in to_fetch:
+                by_type.setdefault(object_id.typ, set()).add(object_id)
 
-        for typ, results in self._read(by_type, effective_time, entry_time).items():
-            for result in results:
-                misses = resolver.misses
-                record = self._validate(typ, result, resolver)
-                if resolver.misses > misses:
-                    unresolved.append((typ, result))
-                else:
-                    ret[PersistableId.parse(record._object_id)] = self.__loaded(record)
+            to_fetch = set()
+            for typ, results in self._read(by_type, effective_time, entry_time).items():
+                for result in results:
+                    resolver.pending = set()
+                    record = self._validate(typ, result, resolver)
+                    object_id = PersistableId.parse(record._object_id)
+                    if resolver.pending:
+                        unresolved[object_id] = (typ, result, resolver.pending)
+                        to_fetch |= resolver.pending - fetched
+                    else:
+                        ret[object_id] = self.__loaded(record)
+                        resolver.resolved[object_id] = record._data
 
-        if unresolved:
-            # Load the references in one read, as of the same times, except those this read has already loaded. They
-            # resolve to their latest versions, even if deleted
-            resolver.resolved.update({i: r._data for i, r in ret.items()})
-            to_load = resolver.pending.difference(ret)
-            loaded = (
-                self.__read(to_load, effective_time, entry_time, ReferenceResolver())
-                if to_load
-                else {}
-            )
-            if missing := to_load.difference(loaded):
-                raise RuntimeError(f"Failed to load references {missing!r}")
+        references = {i for *_, pending in unresolved.values() for i in pending}
+        if missing := references - ret.keys() - unresolved.keys():
+            raise RuntimeError(f"Failed to load references {missing!r}")
 
-            resolver.resolved.update({i: r._data for i, r in loaded.items()})
-            for typ, result in unresolved:
-                record = self._validate(typ, result, resolver)
-                ret[PersistableId.parse(record._object_id)] = self.__loaded(record)
+        # Those referenced first, so that each resolves
+        graph = {i: pending for i, (*_, pending) in unresolved.items()}
+        for object_id in TopologicalSorter(graph).static_order():
+            if object_id in unresolved:
+                typ, result, _ = unresolved[object_id]
+                record = ret[object_id] = self.__loaded(
+                    self._validate(typ, result, resolver)
+                )
+                resolver.resolved[object_id] = record._data
 
-        return ret
+        return {i: r for i, r in ret.items() if i in requested}
 
     @staticmethod
     def __loaded(record: _DataRecord) -> _DataRecord:
@@ -233,16 +240,21 @@ class PersistableStoreBase(PersistableStore):
         return self._serialise(record, context)
 
     def __conflict(
-        self, object_id: PersistableId, obj: Persistable, stored: ObjectRecord
+        self,
+        object_id: PersistableId,
+        instances: Iterable[Persistable],
+        stored: ObjectRecord,
     ) -> str | None:
-        # Why writing obj over the persisted version, stored, would be a conflict, if it would
-        version, latest = obj.object_entry_time, stored._entry_time
-        if version is None:
+        # Why writing the object over the persisted version, stored, would be a conflict, if it would. Its instances are
+        # equal, so if any is of that version, none overwrites changes not seen
+        latest = stored._entry_time
+        versions = {v for obj in instances if (v := obj.object_entry_time) is not None}
+        if not versions:
             # A deleted object may be restored without having been read
             if stored._active and self.__require_load_of_existing:
                 return f"{object_id}, written at {latest}, was not read before being written"
-        elif version != latest:
-            return f"{object_id} was written at {latest}, since the version written at {version}"
+        elif latest not in versions:
+            return f"{object_id} was written at {latest}, since the version written at {max(versions)}"
         return None
 
     @staticmethod
@@ -274,10 +286,8 @@ class PersistableStoreBase(PersistableStore):
 
         context: dict[str, Any] = {COLLECTOR: collector} if by_reference else {}
 
-        objs: dict[PersistableId, Persistable] = {}
         records: dict[PersistableId, dict[str, Any]] = {}
         while new := collector.take():
-            objs.update(new)
             for object_id, obj in new.items():
                 collector.referrer = object_id
                 records[object_id] = self.__dump(object_id, obj, metadata, context)
@@ -296,7 +306,8 @@ class PersistableStoreBase(PersistableStore):
             ) from None
 
         # Before reading their current versions, which may fail if they cannot be
-        self._check_types({type(obj) for obj in objs.values()})
+        instances = collector.instances
+        self._check_types({type(objs[0]) for objs in instances.values()})
 
         # Versions of the objects written or found unchanged
         versions: dict[PersistableId, dt.datetime] = {}
@@ -316,7 +327,7 @@ class PersistableStoreBase(PersistableStore):
             ):
                 del records[i]
                 versions[i] = stored._entry_time
-            elif conflict := self.__conflict(i, objs[i], stored):
+            elif conflict := self.__conflict(i, instances[i], stored):
                 conflicts.append(conflict)
 
         self.__raise_conflicts(conflicts, force_overwrite)
@@ -333,7 +344,8 @@ class PersistableStoreBase(PersistableStore):
 
         versions.update(dict.fromkeys(records, entry_time))
         for object_id, version in versions.items():
-            objs[object_id]._set_object_entry_time(version)
+            for obj in instances[object_id]:
+                obj._set_object_entry_time(version)
 
     def delete(
         self,
@@ -346,11 +358,17 @@ class PersistableStoreBase(PersistableStore):
         Their persisted data is kept: reads as of earlier times find them. Objects not persisted, or already deleted, are
         ignored. Raises WriteConflictError, unless force_overwrite, as write does.
         """
-        objs = {obj.object_id: obj for obj in objects}
-        self._check_types({type(obj) for obj in objs.values()})
-        current = {i: r for i, r in self.__current(objs).items() if r._active}
+        instances: dict[PersistableId, list[Persistable]] = {}
+        for obj in objects:
+            instances.setdefault(obj.object_id, []).append(obj)
+        self._check_types({type(objs[0]) for objs in instances.values()})
+        current = {i: r for i, r in self.__current(instances).items() if r._active}
         self.__raise_conflicts(
-            [c for i, r in current.items() if (c := self.__conflict(i, objs[i], r))],
+            [
+                c
+                for i, r in current.items()
+                if (c := self.__conflict(i, instances[i], r))
+            ],
             force_overwrite,
         )
 
@@ -371,7 +389,8 @@ class PersistableStoreBase(PersistableStore):
                 {} if force_overwrite else expected,
             )
             for object_id in current:
-                objs[object_id]._set_object_entry_time(entry_time)
+                for obj in instances[object_id]:
+                    obj._set_object_entry_time(entry_time)
 
 
 def _batches(

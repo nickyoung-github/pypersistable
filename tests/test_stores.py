@@ -6,6 +6,7 @@ import datetime as dt
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
+from itertools import pairwise
 from typing import Annotated, Literal
 from uuid import UUID
 
@@ -27,6 +28,7 @@ from models import (
     Node,
     PlainUnion,
     TradingBook,
+    loopback_ok,
     registry,
 )
 from pydantic import ConfigDict, Field, NaiveDatetime, ValidationError
@@ -220,6 +222,22 @@ def test_require_load_of_existing(strict_store):
     read.next = Node(name="b")
     read.write(strict_store)
     assert Node.read(strict_store, name="a") == read
+
+
+def test_equal_instances(strict_store):
+    Node(name="a").write(strict_store)
+    read = Node.read(strict_store, name="a")
+    read.next = Node(name="b")
+    anew = Node(name="a", next=Node(name="b"))
+
+    # anew was not read, but read, which is equal, is of the latest version
+    strict_store.write([anew, read])
+    assert anew.object_entry_time == read.object_entry_time is not None
+
+    strict_store.delete([anew, read])
+    assert anew.object_entry_time == read.object_entry_time is not None
+    with pytest.raises(UnknownObjectError):
+        Node.read(strict_store, name="a")
 
 
 def test_force_overwrite_unread(strict_store):
@@ -424,6 +442,7 @@ def test_object_effective_later_is_rewritten(store):
     assert Node.read(store, name="a", effective_time=now) == node
 
 
+@loopback_ok
 def test_concurrent_async_reads(store):
     counterparties = [Counterparty(name=f"C{i}") for i in range(10)]
     store.write(counterparties)
@@ -466,6 +485,22 @@ def test_references_loaded_in_the_same_read_are_not_read_again(store, spy):
 
     store.read([deal.object_id, deal.counterparty.object_id, deal.book.object_id])
     assert spy["reads"] == [{"Deal": 1, "Counterparty": 1, "TradingBook": 1}]
+
+
+def test_references_read_once(store, spy):
+    nodes = [Node(name=n) for n in "abcd"]
+    for node, next_node in pairwise(nodes):
+        node.next = next_node
+    nodes[0].write(store)
+    spy["reads"].clear()
+
+    # All read together, including those they reference, so read once
+    assert store.read([n.object_id for n in nodes]) == {n.object_id: n for n in nodes}
+    assert spy["reads"] == [{"Node": 4}]
+    # Otherwise a level at a time
+    spy["reads"].clear()
+    assert Node.read(store, name="a") == nodes[0]
+    assert spy["reads"] == [{"Node": 1}] * 4
 
 
 def test_references_resolved_as_of_the_same_time(store):
@@ -630,6 +665,7 @@ def _field_type_params():
         yield pytest.param(holder, value, failures, id=label)
 
 
+@loopback_ok
 @pytest.mark.parametrize(("holder", "value", "failures"), list(_field_type_params()))
 def test_field_type_round_trip(make_store, store_kind, holder, value, failures):
     store = make_store()
