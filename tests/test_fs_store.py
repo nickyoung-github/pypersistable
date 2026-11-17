@@ -1,6 +1,6 @@
 """Tests of FSStore's own behaviour: see test_stores for those of every store"""
 
-import os
+import sys
 from dataclasses import dataclass
 from ipaddress import IPv4Address
 from uuid import uuid4
@@ -8,6 +8,7 @@ from uuid import uuid4
 import duckdb
 import pyarrow as pa
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 from models import (
     Counterparty,
     Deal,
@@ -55,6 +56,25 @@ def test_json_by_value_round_trip(json_store):
         Counterparty.read(json_store, name="Acme")  # Embedded, not persisted separately
 
 
+def test_failed_write_leaves_no_dangling_reference(json_store, monkeypatch):
+    write_bytes = LocalFileSystem.write_bytes
+
+    def failing(self, path, *args, **kwargs):
+        if "Counterparty" in str(path) and str(path).endswith(".json"):
+            raise OSError("Disk full")
+        return write_bytes(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(LocalFileSystem, "write_bytes", failing)
+    deal = Deal(
+        deal_id="D", counterparty=Counterparty(name="Acme"), book=TradingBook(name="B")
+    )
+    with pytest.raises(OSError, match="Disk full"):
+        deal.write(json_store)
+    # Not written, as written after the counterparty it references
+    with pytest.raises(UnknownObjectError):
+        Deal.read(json_store, deal_id="D")
+
+
 def test_parquet_records_written_before_active(tmp_path):
     # As written before ObjectRecord._active was added: in no file, so read as its default
     before = persistable_arrow_converter()
@@ -70,9 +90,7 @@ def test_parquet_records_written_before_active(tmp_path):
     assert Node.read(FSStore(f"file://{tmp_path}"), name="a") == node
 
 
-@pytest.mark.skipif(
-    os.geteuid() == 0, reason="root can read files without read permission"
-)
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows doesn't support chmod")
 def test_unreadable_file_raises(store, tmp_path):
     Counterparty(name="Acme").write(store)
     for path in (tmp_path / "Counterparty").iterdir():
