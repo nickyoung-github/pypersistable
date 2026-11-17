@@ -78,9 +78,10 @@ def test_validates(cls):
     assert obj.s == "b"
     with pytest.raises(ValidationError):
         obj.s = 1
-    # Strict: no coercion
+    # Lax: coerced
+    assert cls(i="1").i == 1
     with pytest.raises(ValidationError):
-        cls(i="1")
+        cls(i="a")
 
 
 def test_slots_kept():
@@ -108,7 +109,7 @@ def test_frozen():
     with pytest.raises(FrozenInstanceError):
         obj.i = 2  # pyright: ignore[reportAttributeAccessIssue]
     with pytest.raises(ValidationError):
-        Frozen(i="1")  # pyright: ignore[reportArgumentType]
+        Frozen(i="a")  # pyright: ignore[reportArgumentType]
 
 
 def test_forward_reference():
@@ -161,7 +162,7 @@ def test_delete(cls):
     obj.i = 2
     assert obj.i == 2
     with pytest.raises(ValidationError):
-        obj.i = "2"
+        obj.i = "a"
 
 
 def test_class_attributes_are_defaults():
@@ -194,7 +195,7 @@ def test_validates_before_instantiation():
     # As, e.g., unpickling makes an instance
     obj = object.__new__(Uninstantiated)
     with pytest.raises(ValidationError):
-        obj.i = "1"  # pyright: ignore[reportAttributeAccessIssue]
+        obj.i = "a"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_data_descriptor_fields_excluded():
@@ -233,14 +234,14 @@ def test_post_init_validated(slots):
         i: int
 
         def __post_init__(self):
-            self.i = str(self.i)  # pyright: ignore[reportAttributeAccessIssue]
+            self.i = "a"  # pyright: ignore[reportAttributeAccessIssue]
 
     @dataclass(slots=slots)
     class Own(metaclass=ValidatingDataclassMeta):
         i: int
 
         def __post_init__(self):
-            self.i = str(self.i)  # pyright: ignore[reportAttributeAccessIssue]
+            self.i = "a"  # pyright: ignore[reportAttributeAccessIssue]
 
     @dataclass(slots=slots)
     class Inherited(Unvalidated, metaclass=ValidatingDataclassMeta):
