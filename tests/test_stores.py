@@ -28,6 +28,7 @@ from models import (
     Node,
     PlainUnion,
     TradingBook,
+    loopback_ok,
     registry,
 )
 from pydantic import ConfigDict, Field, NaiveDatetime, ValidationError
@@ -44,10 +45,6 @@ from pypersistable import (
 )
 
 SQL = ("SQLite", "PostgreSQL")
-
-# On Windows the asyncio event loop makes its self-pipe from a loopback TCP connection, which pytest-recording's
-# --block-network would otherwise block
-loopback_ok = pytest.mark.block_network(allowed_hosts=["127.0.0.1"])
 
 
 def test_round_trip(store):
