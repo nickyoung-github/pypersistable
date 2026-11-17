@@ -8,6 +8,7 @@ from uuid import uuid4
 import duckdb
 import pyarrow as pa
 import pytest
+from fsspec.implementations.local import LocalFileSystem
 from models import (
     Counterparty,
     Deal,
@@ -53,6 +54,25 @@ def test_json_by_value_round_trip(json_store):
     assert Deal.read(json_store, deal_id="D") == deal
     with pytest.raises(UnknownObjectError):
         Counterparty.read(json_store, name="Acme")  # Embedded, not persisted separately
+
+
+def test_failed_write_leaves_no_dangling_reference(json_store, monkeypatch):
+    write_bytes = LocalFileSystem.write_bytes
+
+    def failing(self, path, *args, **kwargs):
+        if "Counterparty" in str(path) and str(path).endswith(".json"):
+            raise OSError("Disk full")
+        return write_bytes(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(LocalFileSystem, "write_bytes", failing)
+    deal = Deal(
+        deal_id="D", counterparty=Counterparty(name="Acme"), book=TradingBook(name="B")
+    )
+    with pytest.raises(OSError, match="Disk full"):
+        deal.write(json_store)
+    # Not written, as written after the counterparty it references
+    with pytest.raises(UnknownObjectError):
+        Deal.read(json_store, deal_id="D")
 
 
 def test_parquet_records_written_before_active(tmp_path):

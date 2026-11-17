@@ -2,7 +2,7 @@ import datetime as dt
 import getpass
 import socket
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, make_dataclass
 from functools import cache
 from graphlib import CycleError, TopologicalSorter
@@ -74,11 +74,14 @@ class PersistableStoreBase(PersistableStore):
 
     def _write(
         self,
-        by_type: dict[type[Persistable], list[dict[str, Any]]],
+        batches: Sequence[tuple[type[Persistable], list[dict[str, Any]]]],
         entry_time: dt.datetime,
         expected: Mapping[PersistableId, dt.datetime | None],
     ):
-        """Stores the records, as _serialise returns them.
+        """Stores the records, as _serialise returns them, in batches of one type.
+
+        Records reference only objects in their own or earlier batches, or stored already: a store which does not write
+        atomically should write the batches in order, so that no reader finds a reference to an object not yet written.
 
         expected: the version (entry time) of each object which the write checked for conflicts, None if not persisted,
         or {} if forcing an overwrite. A store able to should raise WriteConflictError, writing nothing, if any has
@@ -306,6 +309,8 @@ class PersistableStoreBase(PersistableStore):
             # A deleted object is written even if unchanged, restoring it
             if (
                 stored._active
+                # Else, e.g. if referenced by an object of an earlier effective time, not found by reads as of it
+                and stored._effective_time <= metadata["_effective_time"]
                 and self.__dump(i, stored._data, metadata, check_context)["_data"]
                 == records[i]["_data"]
             ):
@@ -316,15 +321,15 @@ class PersistableStoreBase(PersistableStore):
 
         self.__raise_conflicts(conflicts, force_overwrite)
 
-        by_type: dict[type[Persistable], list[dict[str, Any]]] = {}
-        for object_id, record in records.items():
-            by_type.setdefault(object_id.typ, []).append(record)
-
-        if by_type:
+        if records:
             expected = {
                 i: s._entry_time if (s := current.get(i)) else None for i in records
             }
-            self._write(by_type, entry_time, {} if force_overwrite else expected)
+            self._write(
+                _batches(records, collector.graph),
+                entry_time,
+                {} if force_overwrite else expected,
+            )
 
         versions.update(dict.fromkeys(records, entry_time))
         for object_id, version in versions.items():
@@ -360,6 +365,40 @@ class PersistableStoreBase(PersistableStore):
 
         if by_type:
             expected = {i: r._entry_time for i, r in current.items()}
-            self._write(by_type, entry_time, {} if force_overwrite else expected)
+            self._write(
+                list(by_type.items()),
+                entry_time,
+                {} if force_overwrite else expected,
+            )
             for object_id in current:
                 objs[object_id]._set_object_entry_time(entry_time)
+
+
+def _batches(
+    records: Mapping[PersistableId, dict[str, Any]],
+    graph: Mapping[PersistableId, set[PersistableId]],
+) -> list[tuple[type[Persistable], list[dict[str, Any]]]]:
+    """The records, in few batches of one type, each after the batches of the objects it references"""
+    batches: list[tuple[type[Persistable], list[dict[str, Any]]]] = []
+    positions: dict[PersistableId, int] = {}
+    # Referenced objects first
+    for i in TopologicalSorter({i: graph.get(i, ()) for i in records}).static_order():
+        if i not in records:
+            continue  # Unchanged, so not written
+        # In or after the batches of the objects it references: after, if of another type
+        after = max(
+            (
+                positions[r] + (r.typ is not i.typ)
+                for r in graph.get(i, ())
+                if r in positions
+            ),
+            default=0,
+        )
+        positions[i] = next(
+            (p for p in range(after, len(batches)) if batches[p][0] is i.typ),
+            len(batches),
+        )
+        if positions[i] == len(batches):
+            batches.append((i.typ, []))
+        batches[positions[i]][1].append(records[i])
+    return batches

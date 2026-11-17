@@ -372,18 +372,18 @@ class SQLStore(PersistableStoreBase):
 
     def _write(
         self,
-        by_type: dict[type[Persistable], list[dict[str, Any]]],
+        batches: Sequence[tuple[type[Persistable], list[dict[str, Any]]]],
         entry_time: dt.datetime,
         expected: Mapping[PersistableId, dt.datetime | None],
     ):
         try:
-            # Atomic: all the records are written, or, e.g. if any conflict, none
+            # Atomic: all the records are written, or, e.g. if any conflict, none. So the batches' order is immaterial
             with self.__engine.begin() as conn:
-                ids = [r["_object_id"] for rs in by_type.values() for r in rs]
+                ids = [r["_object_id"] for _, rs in batches for r in rs]
                 self.__set_latest(
                     conn, ids, entry_time, {str(i): v for i, v in expected.items()}
                 )
-                for typ, records in by_type.items():
+                for typ, records in batches:
                     table = self.__table(typ)
                     conn.execute(insert(table), [self.__row(table, r) for r in records])
         except IntegrityError as e:
