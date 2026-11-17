@@ -32,9 +32,9 @@ from pypersistable import (
 from pypersistable.persistable import Persistable
 from pypersistable.persistable_store import PersistableStore, ReadBatch
 
-# On Windoes the asyncio event loop makes its self-pipe from a loopback TCP connection
-# Tests which run with --block-network fail
-loopback_ok = pytest.mark.block_network(allow_hosts=["127.0.0.1"])
+# On Windows the asyncio event loop makes its self-pipe from a loopback TCP connection, which pytest-recording's
+# --block-network would otherwise block
+loopback_ok = pytest.mark.block_network(allowed_hosts=["127.0.0.1"])
 
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
