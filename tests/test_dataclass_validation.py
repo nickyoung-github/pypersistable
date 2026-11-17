@@ -1,4 +1,5 @@
 import dataclasses
+import sys
 from dataclasses import FrozenInstanceError, InitVar, dataclass, field
 from typing import Annotated, ClassVar
 
@@ -255,6 +256,10 @@ def test_post_init_validated(slots):
             TypeAdapter(cls).validate_python({"i": 1})
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 14),
+    reason="dataclass(slots=True) breaks if calling super() with no arguments pre Python 3.14",
+)
 def test_post_init_super_with_slots():
     @dataclass(slots=True)
     class Base(metaclass=ValidatingDataclassMeta):
