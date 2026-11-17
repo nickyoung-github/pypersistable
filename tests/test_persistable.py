@@ -18,6 +18,7 @@ from models import (
     Scaled,
     Thing,
     TradingBook,
+    loopback_ok,
 )
 from orjson import OPT_SORT_KEYS, dumps
 from pydantic import TypeAdapter, ValidationError
@@ -31,10 +32,6 @@ from pypersistable import (
 )
 from pypersistable.persistable import Persistable
 from pypersistable.persistable_store import PersistableStore, ReadBatch
-
-# On Windows the asyncio event loop makes its self-pipe from a loopback TCP connection, which pytest-recording's
-# --block-network would otherwise block
-loopback_ok = pytest.mark.block_network(allowed_hosts=["127.0.0.1"])
 
 
 def expected_id(typ: type, payload: dict) -> PersistableId:
@@ -279,6 +276,7 @@ def test_enqueue_after_dispatch_raises():
         )
 
 
+@loopback_ok
 def test_read_all_with_loop():
     counterparty = Counterparty(name="Acme")
     store = DictStore(counterparty)
