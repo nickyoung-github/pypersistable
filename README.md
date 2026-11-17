@@ -288,7 +288,8 @@ Parquet an `IncompatibleSchemaError`, naming the changed fields of the file, and
 `ValidationError`.
 
 ### JSON
-Records are written as a JSON array. `bytes` are base64-encoded.
+Records are written as a JSON array. `bytes` are base64-encoded. JSON has no NaN or infinities, so writing a `float`
+holding one raises a `ValueError`.
 
 ### Parquet
 >`ArrowConverter` (in `pypersistable.arrow`) can be used standalone: it does not depend on `Persistable` behaviour
@@ -299,6 +300,7 @@ The Parquet schema is generated from the type hints, with:
 
 - Plain `datetime`s stored as UTC timestamps, keeping their instant: writing a naive value raises a `ValueError`.
   Use pydantic's `NaiveDatetime` for a timestamp without a time zone (or `AwareDatetime` to validate as aware)
+- `time`s as `time64`, which has no time zone: writing a time zone aware value raises a `ValueError`
 - `Decimal`s as `decimal128`, with the precision and scale from pydantic's `max_digits`/`decimal_places`
   if given, else (38, 18). `max_digits` without `decimal_places` raises `UnsupportedTypeError`, as of no fixed scale
 - `Enum` and `Literal` stored as their values, which must be of one type
@@ -356,6 +358,7 @@ store = SQLStore(
   values (structs, collections and `DiscriminatedUnion`) as JSON (JSONB in PostgreSQL). So `by_reference=False` is
   not supported. Fields of types with no Arrow type, e.g. unions other than `T | None`, are JSON too: giving one an
   Arrow type later (e.g. with `add_type`) changes its column's type, which is incompatible
+- Records are read as JSON, so, as for JSON, writing a `float` holding NaN or an infinity raises a `ValueError`
 - Writes are atomic: each is one transaction. A `_latest_versions` table holds each object's latest version, set by
   compare-and-set, so that a write conflicting with a concurrent one raises `WriteConflictError` and writes nothing.
   So does one begun before a concurrent write of its objects, even if forcing an overwrite, as its entry time is
