@@ -78,6 +78,31 @@ def test_naive_datetime_for_aware_timestamp_raises():
         )
 
 
+def test_time_zones_checked_once_converted():
+    # A registered type converting to a datetime, and a value pyarrow accepts which is not one
+    converter = ArrowConverter()
+    converter.add_type(
+        Point,
+        pa.timestamp("us", tz="UTC"),
+        lambda p: dt.datetime.fromtimestamp(p.x, dt.UTC),
+    )
+    timestamp = converter.arrow_type(Point)
+    assert converter.arrow_value(Point(0, 0), timestamp) == dt.datetime(
+        1970, 1, 1, tzinfo=dt.UTC
+    )
+    assert converter.arrow_value(0, timestamp) == 0
+
+    converter.add_type(Point, timestamp, lambda p: dt.datetime.fromtimestamp(p.x))
+    with pytest.raises(ValueError, match="use NaiveDatetime"):
+        converter.arrow_value(Point(0, 0), timestamp)
+
+
+def test_composite_dict_key_raises():
+    # Converted to lists, which are unhashable
+    with pytest.raises(UnsupportedTypeError, match="keys must be scalar"):
+        ArrowConverter().arrow_type(dict[tuple[str, ...], int])
+
+
 def test_add_type_overrides_builtin():
     converter = ArrowConverter()
     converter.add_type(int, pa.int32())
