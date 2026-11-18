@@ -289,7 +289,7 @@ Parquet an `IncompatibleSchemaError`, naming the changed fields of the file, and
 
 ### JSON
 Records are written as a JSON array. `bytes` are base64-encoded. JSON has no NaN or infinities, so writing a `float`
-holding one raises a `ValueError`.
+holding one raises a `ValueError`, as does a `dict` with composite keys, e.g. tuples, which JSON keys cannot represent.
 
 ### Parquet
 >`ArrowConverter` (in `pypersistable.arrow`) can be used standalone: it does not depend on `Persistable` behaviour
@@ -305,7 +305,7 @@ The Parquet schema is generated from the type hints, with:
   if given, else (38, 18). `max_digits` without `decimal_places` raises `UnsupportedTypeError`, as of no fixed scale
 - `Enum` and `Literal` stored as their values, which must be of one type
 - `tuple`, `set` and `frozenset` as lists, whose items must be of one type
-- `dict` as maps
+- `dict` as maps, whose keys must be scalar: composite ones, e.g. tuples, raise `UnsupportedTypeError`
 - `UUID` as strings
 - `Reference` as the referenced object's `object_id`, so `by_reference=False` is not supported
 - `DiscriminatedUnion` as a struct of the type specifier and a nullable field per member
@@ -358,7 +358,8 @@ store = SQLStore(
   values (structs, collections and `DiscriminatedUnion`) as JSON (JSONB in PostgreSQL). So `by_reference=False` is
   not supported. Fields of types with no Arrow type, e.g. unions other than `T | None`, are JSON too: giving one an
   Arrow type later (e.g. with `add_type`) changes its column's type, which is incompatible
-- Records are read as JSON, so, as for JSON, writing a `float` holding NaN or an infinity raises a `ValueError`
+- Records are read as JSON, so, as for JSON, writing a `float` holding NaN or an infinity, or a `dict` with composite
+  keys, raises a `ValueError`
 - Writes are atomic: each is one transaction. A `_latest_versions` table holds each object's latest version, set by
   compare-and-set, so that a write conflicting with a concurrent one raises `WriteConflictError` and writes nothing.
   So does one begun before a concurrent write of its objects, even if forcing an overwrite, as its entry time is
