@@ -1,5 +1,6 @@
 import datetime as dt
 import getpass
+import math
 import socket
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
@@ -12,6 +13,7 @@ from pydantic import ConfigDict
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
 from pydantic_core import CoreSchema
 
+from .deferred_post_init import _RESOLVING
 from .persistable import Persistable
 from .persistable_id import PersistableId
 from .persistable_store import PersistableStore, WriteConflictError
@@ -130,8 +132,9 @@ class PersistableStoreBase(PersistableStore):
         self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
     ) -> _DataRecord:
         """A result of _read, validated as a record of typ"""
+        # By name too: records are dumped by field name, also for fields with aliases, which pydantic validates by
         return type_adapter(self.record_type(typ)).validate_python(
-            result, context={RESOLVER: resolver}
+            result, context={RESOLVER: resolver}, by_name=True
         )
 
     def read(
@@ -170,8 +173,7 @@ class PersistableStoreBase(PersistableStore):
             to_fetch = set()
             for typ, results in self._read(by_type, effective_time, entry_time).items():
                 for result in results:
-                    resolver.pending = set()
-                    record = self._validate(typ, result, resolver)
+                    record = self.__validate(typ, result, resolver)
                     object_id = PersistableId.parse(record._object_id)
                     if resolver.pending:
                         unresolved[object_id] = (typ, result, resolver.pending)
@@ -190,11 +192,22 @@ class PersistableStoreBase(PersistableStore):
             if object_id in unresolved:
                 typ, result, _ = unresolved[object_id]
                 record = ret[object_id] = self.__loaded(
-                    self._validate(typ, result, resolver)
+                    self.__validate(typ, result, resolver)
                 )
                 resolver.resolved[object_id] = record._data
 
         return {i: r for i, r in ret.items() if i in requested}
+
+    def __validate(
+        self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
+    ) -> _DataRecord:
+        # Collecting in pending the references it leaves unresolved, which defer __post_init__ (see _RESOLVING)
+        resolver.pending = set()
+        token = _RESOLVING.set(resolver)
+        try:
+            return self._validate(typ, result, resolver)
+        finally:
+            _RESOLVING.reset(token)
 
     @staticmethod
     def __loaded(record: _DataRecord) -> _DataRecord:
@@ -421,3 +434,20 @@ def _batches(
             batches.append((i.typ, []))
         batches[positions[i]][1].append(records[i])
     return batches
+
+
+def _check_finite(record: Mapping[str, Any]):
+    """Raises ValueError if a record, as python mode serialisation returns it, holds NaN or an infinity: JSON has none,
+    so pydantic would write null"""
+
+    def non_finite(value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(map(non_finite, value.values()))
+        if isinstance(value, list | tuple | set | frozenset):
+            return any(map(non_finite, value))
+        return isinstance(value, float) and not math.isfinite(value)
+
+    if non_finite(record["_data"]):
+        raise ValueError(
+            f"{record['_object_id']} holds NaN or an infinity, which JSON cannot represent"
+        )

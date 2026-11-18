@@ -55,7 +55,17 @@ class VUnique(Unique, metaclass=ValidatingDataclassMeta):
     x: int
 
 
-for _typ in (VLeaf, VBranch, VSlotsLeaf, VSlotsBranch, VById, VUnique):
+@dataclass(slots=True, kw_only=True)
+class VLocated(Identifiable, metaclass=ValidatingDataclassMeta):
+    name: IdField[str]
+    leaf: Reference[VSlotsLeaf]
+    value: int = dataclasses.field(init=False, default=0)
+
+    def __post_init__(self):
+        self.value = self.leaf.value
+
+
+for _typ in (VLeaf, VBranch, VSlotsLeaf, VSlotsBranch, VById, VUnique, VLocated):
     registry.register(_typ.__name__, _typ)
 
 
@@ -105,6 +115,12 @@ def test_reference_id_field(store):
     by_id = VById(leaf=VSlotsLeaf(name="l"))
     by_id.write(store)
     assert VById.read(store, leaf=VSlotsLeaf(name="l")) == by_id
+
+
+def test_post_init_after_references_resolved(store):
+    # Its __post_init__ deferred by Persistable, its assignments validated by ValidatingDataclassMeta
+    VLocated(name="a", leaf=VSlotsLeaf(name="l", value=2)).write(store)
+    assert VLocated.read(store, name="a").value == 2
 
 
 def test_unique(store):
