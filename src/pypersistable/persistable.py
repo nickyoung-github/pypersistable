@@ -25,6 +25,7 @@ from pydantic import (
 )
 from pydantic_core import CoreSchema, PydanticSerializationError, core_schema
 
+from .deferred_post_init import defer_post_init
 from .persistable_id import PersistableId
 from .persistable_store import PersistableStore, ReadBatch, UnknownObjectError
 from .typed_cache import type_adapter, typed_cache
@@ -45,6 +46,18 @@ _COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", defau
 
 class Persistable:
     __object_entry_time = None  # Not annotated, so that it is not a field
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # Called by dataclasses only: harmless otherwise
+        defer_post_init(cls, "__post_init__")
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs):
+        # For BaseModels, once pydantic has made the class: it wraps model_post_init itself if there are private attributes
+        super().__pydantic_init_subclass__(**kwargs)  # pyright: ignore[reportAttributeAccessIssue]
+        if getattr(cls, "__pydantic_post_init__", None):
+            defer_post_init(cls, "model_post_init")
 
     def __hash__(self):
         return hash(self.object_id)
