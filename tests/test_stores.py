@@ -4,11 +4,11 @@ import contextlib
 import dataclasses
 import datetime as dt
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
 from itertools import pairwise
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import pytest
@@ -33,7 +33,14 @@ from models import (
     loopback_ok,
     registry,
 )
-from pydantic import ConfigDict, Field, NaiveDatetime, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NaiveDatetime,
+    PrivateAttr,
+    ValidationError,
+)
 
 from pypersistable import (
     DiscriminatedUnion,
@@ -420,8 +427,53 @@ class Right(Identifiable):
     left: Reference[Left] | None = None
 
 
+@dataclass(kw_only=True)
+class Located(Identifiable):
+    name: IdField[str]
+    counterparties: tuple[Reference[Counterparty], ...]
+    by_role: dict[str, Reference[Counterparty]]
+    locations: tuple[str, ...] = field(init=False, default=())
+
+    def __post_init__(self):
+        # Of the objects referenced: when reading, run once they are loaded
+        counterparties = (*self.counterparties, *self.by_role.values())
+        self.locations = tuple(c.location for c in counterparties)
+
+
+@dataclass(kw_only=True)
+class LocatedBase:
+    """Not Persistable"""
+
+    counterparty: Reference[Counterparty]
+    location: str = field(init=False, default="")
+
+    def __post_init__(self):
+        self.location = self.counterparty.location
+
+
+@dataclass(kw_only=True)
+class InheritsLocated(LocatedBase, Identifiable):
+    name: IdField[str]
+
+
+class ModelLocated(Identifiable, BaseModel):
+    name: IdField[str]
+    counterparty: Reference[Counterparty]
+    location: str = ""
+
+    def model_post_init(self, context: Any):
+        self.location = self.counterparty.location
+
+
+class ModelLocatedPrivate(ModelLocated):
+    # pydantic wraps model_post_init, to initialise them
+    _cache: dict = PrivateAttr(default_factory=dict)
+
+
 registry.register("Left", Left)
 registry.register("Right", Right)
+for _typ in (Located, InheritsLocated, ModelLocated, ModelLocatedPrivate):
+    registry.register(_typ.__name__, _typ)
 
 
 def test_written_in_batches_referenced_first(store, spy):
@@ -433,6 +485,27 @@ def test_written_in_batches_referenced_first(store, spy):
 
     assert spy["writes"] == [[("Node", 3)], [("Left", 1), ("Right", 1), ("Left", 1)]]
     assert Left.read(store, name="a") == left
+
+
+def test_post_init_after_references_resolved(store):
+    acme = Counterparty(name="Acme", location="NW3")
+    other = Counterparty(name="Other", location="SW1")
+    Located(name="a", counterparties=(acme,), by_role={"agent": other}).write(store)
+    assert Located.read(store, name="a").locations == ("NW3", "SW1")
+
+
+@pytest.mark.parametrize(
+    "typ",
+    [InheritsLocated, ModelLocated, ModelLocatedPrivate],
+    ids=lambda t: t.__name__,
+)
+def test_post_init_after_references_resolved_of(store, typ):
+    # __post_init__ inherited from a base not Persistable, and BaseModel's model_post_init
+    typ(name="a", counterparty=Counterparty(name="Acme", location="NW3")).write(store)
+    read = typ.read(store, name="a")
+    assert read.location == "NW3"
+    if typ is ModelLocatedPrivate:
+        assert read._cache == {}
 
 
 def test_object_effective_later_is_rewritten(store):
