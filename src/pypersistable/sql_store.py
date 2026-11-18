@@ -53,7 +53,12 @@ from .fs_store import IncompatibleSchemaError, persistable_arrow_converter
 from .persistable import Persistable
 from .persistable_id import PersistableId
 from .persistable_store import WriteConflictError
-from .persistable_store_base import ObjectRecord, PersistableStoreBase, _DataRecord
+from .persistable_store_base import (
+    ObjectRecord,
+    PersistableStoreBase,
+    _check_finite,
+    _DataRecord,
+)
 from .reference import RESOLVER, ReferenceResolver
 from .type_registry import TypeRegistry
 from .typed_cache import type_adapter
@@ -281,11 +286,19 @@ class SQLStore(PersistableStoreBase):
                 )
         return row
 
+    def _serialise(
+        self, record: _DataRecord, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        # Read as JSON (see __json), so NaN and infinities would be lost, as would NaN by SQLite, which stores it as NULL
+        serialised = super()._serialise(record, context)
+        _check_finite(serialised)
+        return serialised
+
     def _validate(
         self, typ: type[Persistable], result: Any, resolver: ReferenceResolver
     ) -> _DataRecord:
         return type_adapter(self.record_type(typ)).validate_json(
-            result, context={RESOLVER: resolver}
+            result, context={RESOLVER: resolver}, by_name=True
         )
 
     def _read(

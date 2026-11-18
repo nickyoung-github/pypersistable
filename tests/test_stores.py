@@ -3,11 +3,12 @@
 import contextlib
 import dataclasses
 import datetime as dt
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
 from itertools import pairwise
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import pytest
@@ -26,12 +27,20 @@ from models import (
     Kennel,
     ModelDeal,
     Node,
+    Option,
     PlainUnion,
     TradingBook,
     loopback_ok,
     registry,
 )
-from pydantic import ConfigDict, Field, NaiveDatetime, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NaiveDatetime,
+    PrivateAttr,
+    ValidationError,
+)
 
 from pypersistable import (
     DiscriminatedUnion,
@@ -418,8 +427,53 @@ class Right(Identifiable):
     left: Reference[Left] | None = None
 
 
+@dataclass(kw_only=True)
+class Located(Identifiable):
+    name: IdField[str]
+    counterparties: tuple[Reference[Counterparty], ...]
+    by_role: dict[str, Reference[Counterparty]]
+    locations: tuple[str, ...] = field(init=False, default=())
+
+    def __post_init__(self):
+        # Of the objects referenced: when reading, run once they are loaded
+        counterparties = (*self.counterparties, *self.by_role.values())
+        self.locations = tuple(c.location for c in counterparties)
+
+
+@dataclass(kw_only=True)
+class LocatedBase:
+    """Not Persistable"""
+
+    counterparty: Reference[Counterparty]
+    location: str = field(init=False, default="")
+
+    def __post_init__(self):
+        self.location = self.counterparty.location
+
+
+@dataclass(kw_only=True)
+class InheritsLocated(LocatedBase, Identifiable):
+    name: IdField[str]
+
+
+class ModelLocated(Identifiable, BaseModel):
+    name: IdField[str]
+    counterparty: Reference[Counterparty]
+    location: str = ""
+
+    def model_post_init(self, context: Any):
+        self.location = self.counterparty.location
+
+
+class ModelLocatedPrivate(ModelLocated):
+    # pydantic wraps model_post_init, to initialise them
+    _cache: dict = PrivateAttr(default_factory=dict)
+
+
 registry.register("Left", Left)
 registry.register("Right", Right)
+for _typ in (Located, InheritsLocated, ModelLocated, ModelLocatedPrivate):
+    registry.register(_typ.__name__, _typ)
 
 
 def test_written_in_batches_referenced_first(store, spy):
@@ -431,6 +485,27 @@ def test_written_in_batches_referenced_first(store, spy):
 
     assert spy["writes"] == [[("Node", 3)], [("Left", 1), ("Right", 1), ("Left", 1)]]
     assert Left.read(store, name="a") == left
+
+
+def test_post_init_after_references_resolved(store):
+    acme = Counterparty(name="Acme", location="NW3")
+    other = Counterparty(name="Other", location="SW1")
+    Located(name="a", counterparties=(acme,), by_role={"agent": other}).write(store)
+    assert Located.read(store, name="a").locations == ("NW3", "SW1")
+
+
+@pytest.mark.parametrize(
+    "typ",
+    [InheritsLocated, ModelLocated, ModelLocatedPrivate],
+    ids=lambda t: t.__name__,
+)
+def test_post_init_after_references_resolved_of(store, typ):
+    # __post_init__ inherited from a base not Persistable, and BaseModel's model_post_init
+    typ(name="a", counterparty=Counterparty(name="Acme", location="NW3")).write(store)
+    read = typ.read(store, name="a")
+    assert read.location == "NW3"
+    if typ is ModelLocatedPrivate:
+        assert read._cache == {}
 
 
 def test_object_effective_later_is_rewritten(store):
@@ -616,6 +691,12 @@ FIELD_TYPES = {
     ),
     "date": (dt.date, dt.date(2026, 1, 2), {}),
     "time": (dt.time, dt.time(3, 4, 5), {}),
+    "aware_time": (
+        dt.time,
+        dt.time(3, 4, 5, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+        # Its time zone would be lost: Arrow's times have none
+        dict.fromkeys(("Parquet", *SQL), ValueError),
+    ),
     "naive_datetime": (
         dt.datetime,
         naive,
@@ -642,6 +723,15 @@ FIELD_TYPES = {
     "optional_none": (int | None, None, {}),
     "dict": (dict[str, int], {"a": 1}, {}),
     "dict_of_lists": (dict[Colour, list[float]], {Colour.Red: [1.5]}, {}),
+    # JSON has no infinities (nor NaN: see test_nan)
+    "infinity": (float, float("inf"), dict.fromkeys(("Json", *SQL), ValueError)),
+    "nested_infinity": (
+        dict[Colour, list[float]],
+        {Colour.Red: [float("-inf")]},
+        dict.fromkeys(("Json", *SQL), ValueError),
+    ),
+    # Persisted by name, but validated by alias, unless by name too
+    "aliased": (Annotated[int, Field(alias="v")], 1, {}),
     # Members not persisted as objects: tagged, so a date is not read as a str
     "union_of_date_str": (DiscriminatedUnion[dt.date, str], dt.date(2026, 1, 2), {}),
     "union_of_enum_int": (DiscriminatedUnion[Shape, int], Shape.Square, {}),
@@ -684,6 +774,20 @@ def test_field_type_round_trip(make_store, store_kind, holder, value, failures):
     # Unchanged: compared with its persisted schema by a new store, then not rewritten
     read.write(make_store())
     assert read.object_entry_time == obj.object_entry_time
+
+
+def test_nan(store, store_kind):
+    option = Option(ticker="X", strike=float("nan"))
+    if store_kind != "Parquet":
+        # JSON has no NaN: pydantic would write null
+        with pytest.raises(ValueError, match="holds NaN or an infinity"):
+            option.write(store)
+        assert store.read([option.object_id]) == {}
+        return
+
+    option.write(store)
+    # Not equal to itself, so not compared
+    assert math.isnan(store.read([option.object_id])[option.object_id].strike)
 
 
 # Schema evolution: each type is another version of the one before, as if its code had been changed
