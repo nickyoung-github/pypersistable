@@ -166,6 +166,32 @@ def spy(store, monkeypatch):
     return calls
 
 
+def test_reference_not_found_is_read_again(store, monkeypatch):
+    # Missed by one query of a read, but referenced by an object found by a later one, e.g. as a concurrent write of
+    # both became visible in between
+    (deal,) = shared_deals(1)
+    store.write([deal])
+    read = store._read
+    reads = []
+
+    def missing_counterparty(by_type, *args):
+        results = read(by_type, *args)
+        reads.append(by_type)
+        return (
+            results
+            if len(reads) > 1
+            else {t: r for t, r in results.items() if t is not Counterparty}
+        )
+
+    monkeypatch.setattr(store, "_read", missing_counterparty)
+    acme = deal.counterparty
+    assert store.read([acme.object_id, deal.object_id]) == {
+        acme.object_id: acme,
+        deal.object_id: deal,
+    }
+    assert Counterparty in reads[1]  # With the book, the deal's other reference
+
+
 def shared_deals(count: int = 3) -> list[Deal]:
     acme, book = Counterparty(name="Acme"), TradingBook(name="Book")
     return [
@@ -729,6 +755,12 @@ FIELD_TYPES = {
         dict[Colour, list[float]],
         {Colour.Red: [float("-inf")]},
         dict.fromkeys(("Json", *SQL), ValueError),
+    ),
+    # JSON would join a tuple key's items with commas, so not read
+    "tuple_keys": (
+        dict[tuple[str, ...], int],
+        {("a", "b"): 1},
+        {"Parquet": UnsupportedTypeError, **dict.fromkeys(("Json", *SQL), ValueError)},
     ),
     # Persisted by name, but validated by alias, unless by name too
     "aliased": (Annotated[int, Field(alias="v")], 1, {}),

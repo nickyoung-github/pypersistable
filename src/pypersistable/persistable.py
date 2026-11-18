@@ -87,10 +87,12 @@ class Persistable:
                 return str(value.object_id)
             return serialiser(value)
 
+        # Serialising via its schema, keeping any serialiser of its own, e.g. a model_serializer
+        schema = handler(source)
         return {
-            **handler(source),
+            **schema,
             "serialization": core_schema.wrap_serializer_function_ser_schema(
-                serialise, info_arg=True
+                serialise, info_arg=True, schema=schema
             ),
         }  # pyright: ignore[reportReturnType]
 

@@ -161,11 +161,9 @@ class PersistableStoreBase(PersistableStore):
         unresolved: dict[
             PersistableId, tuple[type[Persistable], Any, set[PersistableId]]
         ] = {}
-        fetched: set[PersistableId] = set()
         to_fetch = requested = set(object_ids)
         # A level of references at a time, as of the same times. They resolve to their latest versions, even if deleted
         while to_fetch:
-            fetched |= to_fetch
             by_type: dict[type[Persistable], set[PersistableId]] = {}
             for object_id in to_fetch:
                 by_type.setdefault(object_id.typ, set()).add(object_id)
@@ -177,10 +175,13 @@ class PersistableStoreBase(PersistableStore):
                     object_id = PersistableId.parse(record._object_id)
                     if resolver.pending:
                         unresolved[object_id] = (typ, result, resolver.pending)
-                        to_fetch |= resolver.pending - fetched
+                        to_fetch |= resolver.pending
                     else:
                         ret[object_id] = self.__loaded(record)
                         resolver.resolved[object_id] = record._data
+
+            # Not those found, but again any not: a concurrent write may have written them since
+            to_fetch -= ret.keys() | unresolved.keys()
 
         references = {i for *_, pending in unresolved.values() for i in pending}
         if missing := references - ret.keys() - unresolved.keys():
@@ -436,18 +437,23 @@ def _batches(
     return batches
 
 
-def _check_finite(record: Mapping[str, Any]):
-    """Raises ValueError if a record, as python mode serialisation returns it, holds NaN or an infinity: JSON has none,
-    so pydantic would write null"""
+def _check_json(record: Mapping[str, Any]):
+    """Raises ValueError if a record, as python mode serialisation returns it, holds what JSON cannot represent: NaN or
+    an infinity, which pydantic would write as null, or a composite dict key, e.g. a tuple, which it would write as its
+    items joined by commas"""
 
-    def non_finite(value: Any) -> bool:
+    def invalid(value: Any) -> str | None:
         if isinstance(value, dict):
-            return any(map(non_finite, value.values()))
+            if any(isinstance(k, tuple | frozenset) for k in value):
+                return "a composite dict key"
+            value = [*value.values()]
         if isinstance(value, list | tuple | set | frozenset):
-            return any(map(non_finite, value))
-        return isinstance(value, float) and not math.isfinite(value)
+            return next(filter(None, map(invalid, value)), None)
+        if isinstance(value, float) and not math.isfinite(value):
+            return "NaN or an infinity"
+        return None
 
-    if non_finite(record["_data"]):
+    if reason := invalid(record["_data"]):
         raise ValueError(
-            f"{record['_object_id']} holds NaN or an infinity, which JSON cannot represent"
+            f"{record['_object_id']} holds {reason}, which JSON cannot represent"
         )

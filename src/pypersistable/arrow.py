@@ -136,7 +136,11 @@ class ArrowConverter:
             return pa.list_(self.arrow_type(item_types.pop()))
 
         if origin in (dict, Mapping):
-            return pa.map_(*(self.arrow_type(a) for a in args))
+            key_type, item_type = (self.arrow_type(a) for a in args)
+            if pa.types.is_nested(key_type):
+                # Converted to unhashable lists or dicts
+                raise UnsupportedTypeError(f"Unsupported {hint}: keys must be scalar")
+            return pa.map_(key_type, item_type)
 
         if isinstance(hint, type):
             if issubclass(hint, Enum):
@@ -173,27 +177,30 @@ class ArrowConverter:
             return [self.arrow_value(v, arrow_type.value_type) for v in value]
         if isinstance(value, Enum):
             value = value.value
+
+        typ = type(value)
+        if typ not in self.__to_arrow:
+            entry = self.__type_entry(typ)
+            self.__to_arrow[typ] = entry[1] if entry is not None else None
+        if (to_arrow := self.__to_arrow[typ]) is not None:
+            value = to_arrow(value)
+
+        # Checked once converted: a registered type may convert to either
         if (
-            pa.types.is_timestamp(arrow_type)
+            isinstance(value, dt.datetime)
+            and pa.types.is_timestamp(arrow_type)
             and arrow_type.tz is not None
             and value.utcoffset() is None
         ):
             raise ValueError(
                 f"Naive datetime {value} for a time zone aware timestamp: use NaiveDatetime for no time zone"
             )
-        if pa.types.is_time(arrow_type) and value.tzinfo is not None:
+        if isinstance(value, dt.time) and value.tzinfo is not None:
             # Not converted to UTC: without a date, a time's offset may be unknown, e.g. for a ZoneInfo
             raise ValueError(
                 f"Time zone aware time {value}: {arrow_type} has no time zone"
             )
-
-        typ = type(value)
-        if typ not in self.__to_arrow:
-            entry = self.__type_entry(typ)
-            self.__to_arrow[typ] = entry[1] if entry is not None else None
-
-        to_arrow = self.__to_arrow[typ]
-        return value if to_arrow is None else to_arrow(value)
+        return value
 
     def struct_fields(self, typ: type) -> Mapping[str, Any] | None:
         """The field type hints of a struct-like type, else None"""
