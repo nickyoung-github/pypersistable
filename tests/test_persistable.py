@@ -21,7 +21,7 @@ from models import (
     loopback_ok,
 )
 from orjson import OPT_SORT_KEYS, dumps
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError, model_serializer
 
 from pypersistable import (
     Identifiable,
@@ -299,3 +299,17 @@ def test_model_hash_is_object_ids():
 def test_persistable_id_type_not_implemented():
     with pytest.raises(NotImplementedError):
         Persistable.id_type()
+
+
+class Tenfold(Identifiable, BaseModel):
+    name: IdField[str]
+    value: int
+
+    @model_serializer(mode="wrap")
+    def _tenfold(self, handler):
+        return {**handler(self), "value": self.value * 10}
+
+
+def test_own_serialiser_is_kept():
+    # Wrapped by Persistable's, rather than replaced
+    assert Tenfold(name="a", value=1).model_dump() == {"name": "a", "value": 10}

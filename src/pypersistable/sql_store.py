@@ -56,7 +56,7 @@ from .persistable_store import WriteConflictError
 from .persistable_store_base import (
     ObjectRecord,
     PersistableStoreBase,
-    _check_finite,
+    _check_json,
     _DataRecord,
 )
 from .reference import RESOLVER, ReferenceResolver
@@ -291,7 +291,7 @@ class SQLStore(PersistableStoreBase):
     ) -> dict[str, Any]:
         # Read as JSON (see __json), so NaN and infinities would be lost, as would NaN by SQLite, which stores it as NULL
         serialised = super()._serialise(record, context)
-        _check_finite(serialised)
+        _check_json(serialised)
         return serialised
 
     def _validate(
