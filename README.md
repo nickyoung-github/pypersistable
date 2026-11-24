@@ -235,6 +235,43 @@ best_boy, blofeld = store.read_all(
 loaded = store.read([best_boy.object_id, blofeld.object_id])
 ```
 
+### Querying
+`PersistableStore.exec` reads the objects of a type meeting conditions on their fields, given with `select` (in
+`pypersistable.query`: install `pypersistable[sql]`). Registering a class makes its fields, as attributes of the
+class, its query columns. They are SQLAlchemy's, so conditions are written, and combined, with its operators:
+
+```python
+from pypersistable.query import col, select
+
+store.exec(select(Address).where(Address.postcode == "HV1 1ZZ", Address.town == ""))
+store.exec(select(Customer).where(col(Customer.name).startswith("Blofeld")))
+# By the fields of the objects which fields hold, embedded or by Reference, to any depth
+store.exec(select(Customer).where(Customer.address.country == Country.Krakatoa))
+# By a referenced object itself, or its id
+store.exec(select(Customer).where(Customer.address == lair))
+```
+
+An object is found if its latest version meets the conditions, as do the latest versions of the objects it
+references, as of the `effective_time` and `entry_time` passed to `exec`, as for reads. Deleted objects are not
+found, though deleted objects referenced are followed, as reads resolve them.
+
+To type checkers, a class's field is of its type, not a column: they check field names, also of the objects held,
+but take a condition to be a `bool` and know none of a column's methods. `col` casts a field or condition to a column,
+e.g. `col(Customer.name).in_(names)` or `~col(Address.town == "")`. They also reject the fields of an object which may be
+`None`, e.g. of `Reference[Customer] | None`: `typing.cast` it, or disable the check (pyright's
+`reportOptionalMemberAccess`).
+
+Queries are supported by `SQLStore` and, for Parquet, `FSStore`, which build the same query: SQLAlchemy generates
+the SQL. Note:
+- A class's attribute for a field is its query column only once it is registered: until then, and for unregistered
+  subclasses, it is the field's default, if any. Redefining a field in a subclass of a registered `BaseModel` makes
+  pydantic warn that it shadows an attribute
+- A field added since an object was written is null in it, not its default as read
+- Only objects of the type itself are found, or followed by reference: not those of its subclasses
+- Fields holding collections, `DiscriminatedUnion`s or references to several types have no fields to query by
+- In `SQLStore`, embedded objects are JSON: of their fields, only strings (and string enums), integers, floats and
+  booleans can be compared. In SQLite, `Decimal`s are text, so are ordered as text
+
 ### Deleting
 `Persistable.del_` (or `PersistableStore.delete`) marks objects deleted, as of an optional `effective_time`, by writing
 a new version of their persisted data with `_active=False`. Reads no longer find them, but their data is kept: reads

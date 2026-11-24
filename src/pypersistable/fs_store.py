@@ -5,7 +5,7 @@ from enum import Enum, auto
 from itertools import pairwise
 from pathlib import PurePosixPath
 from types import NoneType, UnionType
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Union, get_args, get_origin
 from uuid import uuid4
 
 import duckdb
@@ -24,6 +24,11 @@ from .persistable_store_base import PersistableStoreBase, _check_json, _DataReco
 from .reference import RESOLVER, ReferenceResolver, _Reference
 from .type_registry import TypeRegistry
 from .typed_cache import type_adapter
+
+if TYPE_CHECKING:
+    import sqlalchemy as sa
+
+    from .query import Select
 
 
 def persistable_arrow_converter() -> ArrowConverter:
@@ -336,6 +341,61 @@ class FSStore(PersistableStoreBase):
                 )
                 for typ, ids in by_type.items()
             }
+
+    def _query(
+        self,
+        statement: "Select[Any]",
+        effective_time: dt.datetime,
+        entry_time: dt.datetime,
+    ) -> list[str]:
+        if self.record_format is not RecordFormat.Parquet:
+            raise NotImplementedError(
+                f"{self!r} does not support queries: only of Parquet"
+            )
+
+        # Lazily: queries need sqlalchemy, which FSStore otherwise does not
+        import sqlalchemy as sa
+
+        from .query import build, duckdb_sql
+
+        # Of the _data of each type's records: the fields persisted, in any file
+        data_types: dict[type, pa.StructType] = {}
+
+        with self.__conn.cursor() as conn:
+
+            def run(query: "sa.Select") -> duckdb.DuckDBPyRelation:
+                sql, params = duckdb_sql(query)
+                return conn.sql(sql, params=params)
+
+            def records(typ: type[Persistable]) -> "sa.FromClause | None":
+                files = f"{self.__directory(typ)!s}/**/*.parquet"
+                persisted = sa.func.read_parquet(
+                    self.__duckdb_path(files), sa.text("union_by_name = true")
+                ).table_valued("_object_id", "_effective_time", "_entry_time", "_data")
+                try:
+                    schema = run(sa.select(persisted.c._data).limit(0)).to_arrow_table()
+                except duckdb.IOException:
+                    if self.__fs.glob(files):
+                        raise
+                    return None
+                data_types[typ] = schema.schema.field(0).type
+                return persisted
+
+            def field(
+                latest: "sa.FromClause", typ: type, path: tuple[str, ...], _: Any
+            ) -> "sa.ColumnElement":
+                column, data_type = latest.c._data, data_types[typ]
+                for name in path:
+                    if data_type.get_field_index(name) < 0:
+                        return sa.null()  # Added since any was written
+                    column = sa.func.struct_extract(column, name)
+                    data_type = data_type.field(name).type
+                return column
+
+            query = build(
+                statement, records, field, self.__arrow, effective_time, entry_time
+            )
+            return [] if query is None else [i for (i,) in run(query).fetchall()]
 
     def _serialise(
         self, record: _DataRecord, context: dict[str, Any]

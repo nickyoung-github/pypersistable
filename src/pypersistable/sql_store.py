@@ -23,6 +23,7 @@ from sqlalchemy import (
     DateTime,
     Double,
     Engine,
+    FromClause,
     Integer,
     Interval,
     LargeBinary,
@@ -38,6 +39,7 @@ from sqlalchemy import (
     func,
     insert,
     inspect,
+    null,
     or_,
     select,
     tuple_,
@@ -59,6 +61,8 @@ from .persistable_store_base import (
     _check_json,
     _DataRecord,
 )
+from .query import Select as Query
+from .query import build
 from .reference import RESOLVER, ReferenceResolver
 from .type_registry import TypeRegistry
 from .typed_cache import type_adapter
@@ -334,6 +338,56 @@ class SQLStore(PersistableStoreBase):
                 typ: self.__records(conn, typ, latest(ids))
                 for typ, ids in by_type.items()
             }
+
+    def _query(
+        self,
+        statement: Query[Any],
+        effective_time: dt.datetime,
+        entry_time: dt.datetime,
+    ) -> list[str]:
+        with self.__engine.connect() as conn:
+
+            def records(typ: type[Persistable]) -> FromClause | None:
+                if (persisted := self.__persisted(conn, typ)) is None:
+                    return None
+                # Those persisted, e.g. not added since
+                columns = self.__table(typ).columns
+                return select(*(c for c in columns if c.name in persisted)).subquery()
+
+            query = build(
+                statement,
+                records,
+                self.__field,
+                self.__arrow,
+                effective_time,
+                entry_time,
+            )
+            return [] if query is None else [*conn.scalars(query)]
+
+    def __field(
+        self, records: FromClause, _: type, path: tuple[str, ...], hint: Any
+    ) -> ColumnElement:
+        if (column := records.c.get(path[0])) is None:
+            return null()  # Added since any was written
+        if len(path) == 1:
+            return column
+
+        # Of an embedded object, held as JSON, in which only these are as they are compared
+        for name in path[1:]:
+            column = column[name]
+        arrow_type = self.__arrow_type(hint)
+        for is_type, as_type in (
+            (pa.types.is_string, "as_string"),
+            (pa.types.is_integer, "as_integer"),
+            (pa.types.is_floating, "as_float"),
+            (pa.types.is_boolean, "as_boolean"),
+            (pa.types.is_struct, "as_string"),  # To compare with None
+        ):
+            if arrow_type is not None and is_type(arrow_type):
+                return getattr(column, as_type)()
+        raise UnsupportedTypeError(
+            f"{self!r} cannot query {'.'.join(path)}, a field of an embedded object: it is of type {arrow_type}"
+        )
 
     def _check_types(self, types: set[type[Persistable]]):
         for typ in types - self.__checked:

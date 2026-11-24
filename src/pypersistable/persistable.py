@@ -1,8 +1,11 @@
 import datetime as dt
 from collections.abc import Coroutine
 from contextvars import ContextVar
-from dataclasses import InitVar, fields, make_dataclass
+from dataclasses import MISSING, InitVar, fields, is_dataclass, make_dataclass
+from functools import cache
 from hashlib import sha512
+from importlib.util import find_spec
+from inspect import getattr_static, isdatadescriptor
 from typing import (
     Annotated,
     Any,
@@ -15,6 +18,7 @@ from typing import (
     get_type_hints,
     overload,
 )
+from weakref import WeakSet
 
 from orjson import OPT_SORT_KEYS, dumps
 from pydantic import (
@@ -44,6 +48,48 @@ _ID_ONLY = "id_only"
 _COMPUTING_IDS: ContextVar[tuple[Any, ...]] = ContextVar("_COMPUTING_IDS", default=())
 
 
+# The registered classes: their fields are, as attributes of the class, their query columns (see query)
+_QUERYABLE: WeakSet[type] = WeakSet()
+
+
+class _QueryField:
+    """Replaces a registered class's attribute for a field, behaving as it, but for the class itself, for which it is
+    the field's query column. Not for its subclasses until they are registered: e.g. dataclass takes the attribute of
+    a class it is making to be the field's default"""
+
+    def __init__(self, name: str, wrapped: Any):
+        self.name = name
+        self.__wrapped__ = wrapped
+
+    def __get__(self, obj: Any, owner: type | None = None) -> Any:
+        if obj is None and owner is not None and owner in _QUERYABLE:
+            from .query import _attribute  # Lazily: it needs sqlalchemy
+
+            return _attribute(owner, owner, (self.name,))
+
+        wrapped = self.__wrapped__
+        if hasattr(type(wrapped), "__get__"):
+            return wrapped.__get__(obj, owner)
+        if wrapped is MISSING:
+            raise AttributeError(self.name)
+        return wrapped
+
+
+class _QueryDataField(_QueryField):
+    """Of a data descriptor, e.g. a slot: unlike others, it takes precedence over the values of instances"""
+
+    def __set__(self, obj: Any, value: Any):
+        self.__wrapped__.__set__(obj, value)
+
+    def __delete__(self, obj: Any):
+        self.__wrapped__.__delete__(obj)
+
+
+@cache
+def _has_sqlalchemy() -> bool:
+    return find_spec("sqlalchemy") is not None
+
+
 class Persistable:
     __object_entry_time = None  # Not annotated, so that it is not a field
 
@@ -51,6 +97,24 @@ class Persistable:
         super().__init_subclass__(**kwargs)
         # Called by dataclasses only: harmless otherwise
         defer_post_init(cls, "__post_init__")
+
+    @classmethod
+    def _registered(cls):
+        """Called by TypeRegistry, so once cls is made, e.g. by dataclass: makes its fields its query columns"""
+        if cls in _QUERYABLE or not _has_sqlalchemy():
+            return
+        names = (
+            [f.name for f in fields(cls)]
+            if is_dataclass(cls)
+            else getattr(cls, "model_fields", ())
+        )
+        for name in names:
+            attr = getattr_static(cls, name, MISSING)
+            # Else inherited from a registered base
+            if not isinstance(attr, _QueryField):
+                field = _QueryDataField if isdatadescriptor(attr) else _QueryField
+                setattr(cls, name, field(name, attr))
+        _QUERYABLE.add(cls)
 
     @classmethod
     def __pydantic_init_subclass__(cls, **kwargs):

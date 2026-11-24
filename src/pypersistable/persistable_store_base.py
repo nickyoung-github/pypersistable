@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, make_dataclass
 from functools import cache
 from graphlib import CycleError, TopologicalSorter
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ConfigDict
 from pydantic.json_schema import GenerateJsonSchema, JsonSchemaValue
@@ -19,6 +19,9 @@ from .persistable_id import PersistableId
 from .persistable_store import PersistableStore, WriteConflictError
 from .reference import COLLECTOR, RESOLVER, ReferenceCollector, ReferenceResolver
 from .typed_cache import type_adapter
+
+if TYPE_CHECKING:
+    from .query import Select
 
 
 @dataclass(kw_only=True)
@@ -90,6 +93,15 @@ class PersistableStoreBase(PersistableStore):
         since changed, i.e. been written concurrently
         """
 
+    def _query(
+        self,
+        statement: "Select[Any]",
+        effective_time: dt.datetime,
+        entry_time: dt.datetime,
+    ) -> list[str]:
+        """The ids of the objects statement selects, as of the times: see query.build"""
+        raise NotImplementedError(f"{self!r} does not support queries")
+
     @property
     def _references_by_value(self) -> bool:
         """Whether write supports by_reference=False, persisting referenced objects within those referencing them"""
@@ -148,6 +160,21 @@ class PersistableStoreBase(PersistableStore):
             object_ids, effective_time, entry_time, ReferenceResolver()
         )
         return {i: r._data for i, r in records.items() if r._active}
+
+    def exec[T: Persistable](
+        self,
+        statement: "Select[T]",
+        effective_time: dt.datetime = dt.datetime.max,
+        entry_time: dt.datetime = dt.datetime.max,
+    ) -> list[T]:
+        """The objects whose latest versions, as of the times, meet statement's conditions, as do those of the objects
+        they reference. Not those deleted, though the objects referenced may be"""
+        ids = [
+            PersistableId.parse(i)
+            for i in self._query(statement, effective_time, entry_time)
+        ]
+        objects = self.read(ids, effective_time, entry_time)
+        return [cast(T, objects[i]) for i in ids if i in objects]
 
     def __read(
         self,

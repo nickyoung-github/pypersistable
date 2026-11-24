@@ -130,6 +130,8 @@ def _install_descriptors(cls: type):
     for f in fields(cls):
         # The attribute in effect for the field: a slot, else values are kept in the instance's __dict__
         attr = getattr_static(cls, f.name, None)
+        # That which a wrapper inherited from a base replaced, e.g. Persistable's for its query column
+        attr = getattr(attr, "__wrapped__", attr)
         if isinstance(attr, _SlotFieldDescriptor):
             attr = attr.slot
 

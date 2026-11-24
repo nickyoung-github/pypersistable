@@ -9,6 +9,7 @@ from .persistable_id import PersistableId
 
 if TYPE_CHECKING:
     from .persistable import Persistable
+    from .query import Select
 
 
 class WriteConflictError(Exception):
@@ -49,6 +50,13 @@ class PersistableStore:
         effective_time: dt.datetime = dt.datetime.max,
         force_overwrite: bool = False,
     ): ...
+
+    def exec[T: "Persistable"](
+        self,
+        statement: "Select[T]",
+        effective_time: dt.datetime = dt.datetime.max,
+        entry_time: dt.datetime = dt.datetime.max,
+    ) -> list[T]: ...
 
     @staticmethod
     def read_all(

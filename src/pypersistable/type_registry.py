@@ -14,6 +14,13 @@ class UnregisteredTypeError(Exception):
         super().__init__(f"Unregistered type {item!r}")
 
 
+def _registered[T](typ: type[T]) -> type[T]:
+    # Tells a type that it is registered, if it asks to be: once loaded, if registered as an EntryPoint
+    if (registered := getattr(typ, "_registered", None)) is not None:
+        registered()
+    return typ
+
+
 @dataclass(frozen=True)
 class TypeInfo[T]:
     name: str
@@ -22,11 +29,9 @@ class TypeInfo[T]:
 
     @property
     def resolved_type(self) -> type[T]:
-        return (
-            cast(type[T], self.typ.load())
-            if isinstance(self.typ, EntryPoint)
-            else self.typ
-        )
+        if not isinstance(self.typ, EntryPoint):
+            return self.typ
+        return _registered(cast(type[T], self.typ.load()))
 
 
 class TypeRegistry[T]:
@@ -109,4 +114,4 @@ class TypeRegistry[T]:
         if isinstance(typ, EntryPoint):
             self.__by_type_name[typ.value] = type_info
         else:
-            self.__by_type[typ] = type_info
+            self.__by_type[_registered(typ)] = type_info
