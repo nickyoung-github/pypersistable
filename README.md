@@ -305,6 +305,82 @@ An object can also specify an `entry_time` while being written. This allows you 
 time but still allow you to see what would have been observed at the original time of writing, for example, if you
 wish to back-date a change to an order.
 
+### Event-sourced objects
+An `EventSourced` object is a label only, e.g. of a deal: a `Unique`, its fields identify it. Its state is that left
+by its events, each an `Event` with a field which is a `Reference` to it, and one to the event it follows:
+
+```python
+@dataclass(frozen=True, kw_only=True)
+class DealState:
+    notional: float
+    expired: bool = False
+
+
+@dataclass(frozen=True)
+class Deal(EventSourced[DealState]):
+    deal_id: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class DealEvent(Event[DealState], Identifiable):  # A base, which need not be registered
+    deal: IdField[Reference[Deal]]
+    event_id: IdField[UUID] = field(default_factory=uuid4)
+    # The event it follows: not compared or shown, as that would be of all the events before it
+    previous: "Reference[DealEvent] | None" = field(
+        default=None, compare=False, repr=False
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class Initiated(DealEvent):
+    notional: float
+
+    def apply(self, state: DealState | None) -> DealState:
+        return DealState(notional=self.notional)
+
+
+@dataclass(frozen=True, kw_only=True)
+class Upsized(DealEvent):
+    by: float
+
+    def apply(self, state: DealState | None) -> DealState:
+        return replace(state, notional=state.notional + self.by)
+
+
+deal = Deal(deal_id="D1")
+initiated = Initiated(deal=deal, notional=100)
+initiated.write(store, effective_time=trade_date)  # Writes the Deal too
+Upsized(deal=deal, previous=initiated, by=50).write(store, effective_time=upsize_date)
+
+deal.state(store)  # DealState(notional=150)
+deal.state(store, effective_time=trade_date)  # DealState(notional=100)
+deal.events(
+    store
+)  # [Initiated(...), Upsized(...)]: the last is that which the next event follows
+```
+
+`events` queries (see [Querying](#querying), so needing a store which supports it) each registered subclass of
+`Event` for those referencing the object, as of the `effective_time` and `entry_time` given, and returns each after
+the event it follows: its field which is a `Reference` to an `Event`. `state` applies each in turn to the state the
+last left, starting with `None`.
+
+An event is persisted as any other object, so the state as of an earlier `entry_time` is as it was known then, and:
+- An event is corrected by writing it again: it keeps its place
+- An event is cancelled by deleting it: that following it then follows that before it
+- An event is inserted by writing it, then that which is to follow it again, following it
+- Two events following the same event, or none, e.g. written concurrently, raise a `ValueError` when the events are
+  read, until one is written again, following the other
+- An event is effective no later than those following it, as for any object referenced: writing an event with an
+  earlier `effective_time` than that it follows writes that again, as of it
+
+Note:
+- Events are not checked as they are written: one which cannot be applied raises only when the state is next read
+- Writing an event checks all those before it against their persisted versions, as for any objects referenced, and
+  reading one alone (rather than with `events`) reads those before it one at a time
+- Event classes registered as an `EntryPoint` are found only once loaded, and fields which are a `Reference` to
+  several types are not matched
+- pydantic warns (`GenericBeforeBaseModelWarning`) of a `BaseModel` which is `EventSourced` or an `Event`: harmlessly
+
 ### Schema evolution
 Fields may be added to a type, with defaults, which apply when reading objects written before they were added.
 Changing a field's type is not supported, nor is removing (or renaming) a field of a type which forbids extra fields

@@ -1,6 +1,7 @@
 from .arrow import ArrowConverter, UnsupportedTypeError
 from .dataclass_validation import ValidatingDataclassMeta
 from .discriminated_union import DiscriminatedUnion
+from .event_sourced import Event, EventSourced
 from .fs_store import (
     FSStore,
     IncompatibleSchemaError,
@@ -17,6 +18,8 @@ from .type_registry import RegistrationError, TypeRegistry, UnregisteredTypeErro
 __all__ = (
     "ArrowConverter",
     "DiscriminatedUnion",
+    "Event",
+    "EventSourced",
     "FSStore",
     "IdField",
     "Identifiable",
